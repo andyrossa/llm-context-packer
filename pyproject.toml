@@ -1,0 +1,261 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ithrl"
+version = "0.4.0"
+description = "Find smaller agent contexts that preserve a selected model behavior"
+readme = "README.md"
+authors = [
+  { name = "Vincent Morel" },
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+  "filelock>=3.32.4",
+  "genai-prices==0.2.4",
+  "github-copilot-sdk==1.0.28",
+  "jsonschema>=4.25",
+  "packaging>=24.2",
+  "platformdirs>=4.3",
+  "pydantic>=2.12",
+  "rich>=14",
+  "typer>=0.16",
+]
+
+[project.urls]
+Source = "https://github.com/andyrossa/llm-context-packer"
+Issues = "https://github.com/andyrossa/llm-context-packer/issues"
+Documentation = "https://andyrossa.github.io/ithrl/"
+Changelog = "https://github.com/andyrossa/llm-context-packer/releases"
+
+[project.scripts]
+ithrl = "ithrl.cli:app"
+
+[project.optional-dependencies]
+compare = [
+    "scipy>=1.18",
+]
+fuzz = [
+    "scipy>=1.18",
+]
+
+[dependency-groups]
+audit = [
+  "pip-audit==2.10.1",
+]
+docs = [
+  "mkdocs==1.6.1",
+  "mkdocs-shadcn==0.12.2",
+]
+release = [
+  "python-semantic-release==10.7.0",
+]
+dev = [
+  "GitPython>=3.2",
+  "hypothesis>=6.138",
+  "pre-commit>=4.3",
+  "pyrefly==1.4.0",
+  "pytest>=9",
+  "pytest-benchmark>=5.2.3",
+  "pytest-cov>=7",
+  "pytest-github-actions-annotate-failures>=0.4.2",
+  "PyYAML>=6",
+  "radon==6.0.1",
+  "ruff==0.17.3",
+  "rumdl==0.3.2",
+  "scipy-stubs>=1.18",
+  "types-jsonschema>=4.25",
+  "types-PyYAML>=6",
+]
+branding = [
+    "fonttools==4.68.0",
+    "resvg-py==0.5.0",
+]
+
+[tool.uv]
+required-version = "==0.13.4"
+
+[tool.semantic_release]
+allow_zero_version = true
+major_on_zero = false
+commit_parser = "conventional"
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.remote]
+url = "https://github.com/andyrossa/llm-context-packer"
+ignore_token_for_push = true
+
+[tool.semantic_release.changelog]
+mode = "init"
+template_dir = ".github/changelog"
+exclude_commit_patterns = ['^(?:build|chore|ci|docs|style|test)(?:\([^)]*\))?!?: ']
+
+[tool.semantic_release.changelog.environment]
+trim_blocks = true
+lstrip_blocks = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/examples/fuzz/*.jsonl",
+  "/examples/fuzz/*.toml",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "/README.md",
+  "/ROADMAP.md",
+  "/docs/native-runs.md",
+  "/docs/agent-skill.md",
+  "/docs/reduction.md",
+  "/docs/fuzzing.md",
+  "/docs/comparison.md",
+  "/docs/results.md",
+  "/docs/index.md",
+  "/docs/cli.md",
+  "/docs/troubleshooting.md",
+  "/docs/measurements.md",
+  "/docs/architecture.md",
+  "/docs/decisions/*.md",
+  "/docs/research/*.md",
+  "/docs/third-party-notices.txt",
+  "/docs/branding/ithrl-logo-light.svg",
+  "/docs/branding/ithrl-logo-dark.svg",
+  "/docs/branding/ithrl-icon.svg",
+  "/docs/branding/ithrl-favicon.svg",
+  "/docs/branding/ithrl-logo.png",
+  "/docs/branding/ithrl-social.png",
+  "/docs/branding/branding.css",
+  "/CONTRIBUTING.md",
+  "/pyproject.toml",
+  "/skills/ithrl",
+  "/src",
+]
+exclude = [
+  "**/__pycache__",
+  "**/*.py[cod]",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ithrl"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills/ithrl" = "ithrl/.agents/skills/ithrl"
+
+[tool.pyrefly]
+preset = "strict"
+project-includes = ["src", "tests", "scripts/release.py"]
+python-version = "3.12"
+search-path = ["src", "tests"]
+
+[tool.pytest]
+pythonpath = ["tests"]
+markers = [
+  "native_smoke(profile): explicit approved native harness/provider test, never default CI",
+  "benchmark: provider-free performance measurements, explicitly selected with --benchmark-only",
+]
+addopts = [
+  "--benchmark-skip",
+  "--strict-config",
+  "--strict-markers",
+  "--cov=ithrl",
+  "--cov-branch",
+  "--cov-report=term-missing:skip-covered",
+]
+filterwarnings = ["error"]
+testpaths = ["tests"]
+strict_xfail = true
+
+[tool.coverage.run]
+branch = true
+source = ["ithrl"]
+
+[tool.coverage.report]
+fail_under = 90
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise AssertionError",
+  "raise NotImplementedError",
+]
+show_missing = true
+skip_covered = true
+
+[tool.rumdl]
+line-length = 100
+
+[tool.rumdl.per-file-ignores]
+# Semantic Release keeps each generated entry and its links on one line.
+"CHANGELOG.md" = ["MD013"]
+# Typer owns usage prompts, aligned option descriptions and prose wrapping.
+"docs/cli.md" = ["MD013", "MD014", "MD064"]
+
+[tool.rumdl.per-file-flavor]
+"docs/**/*.md" = "mkdocs"
+
+[tool.rumdl.MD013]
+line-length = 100
+reflow = true
+# Preserve runnable commands and tables; wrap prose instead.
+code-blocks = false
+tables = false
+
+[tool.ruff]
+extend-exclude = ["*.md"]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+ignore = [
+  "COM812", # Conflicts with the formatter.
+  "ISC001", # Conflicts with the formatter.
+  "S105",   # JSON and protocol fields commonly use the name `token`.
+  "S106",   # The same false-positive risk applies to function arguments.
+  "S107",   # The same false-positive risk applies to default arguments.
+]
+select = [
+  "ASYNC",
+  "B",
+  "C4",
+  "DTZ",
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "G",
+  "I",
+  "PIE",
+  "PT",
+  "PTH",
+  "RET",
+  "RUF",
+  "S",
+  "SIM",
+  "T20",
+  "UP",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+  "S101", # Assertions are the normal pytest interface.
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
