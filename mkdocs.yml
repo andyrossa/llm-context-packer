@@ -1,0 +1,87 @@
+site_name: ithrl
+site_description: Find smaller agent contexts that preserve a selected model behavior
+site_url: https://andyrossa.github.io/ithrl/
+repo_url: https://github.com/andyrossa/llm-context-packer
+edit_uri: blob/main/docs/
+docs_dir: docs
+site_dir: .local/site
+theme:
+  name: shadcn
+  custom_dir: docs/branding/overrides
+  icon: branding/ithrl-icon.svg
+  favicon: branding/ithrl-favicon.svg
+  show_stargazers: false
+  hide_source_files: true
+extra_css:
+  - branding/branding.css
+plugins:
+  - search
+hooks:
+  - scripts/docs_theme.py
+markdown_extensions:
+  - tables
+  - fenced_code
+  - codehilite
+  - toc:
+      permalink: true
+nav:
+  - Overview: index.md
+  - Agent skill: agent-skill.md
+  - Native runs: native-runs.md
+  - Native reduction: reduction.md
+  - Context fuzzing: fuzzing.md
+  - Context comparison: comparison.md
+  - Results and privacy: results.md
+  - CLI reference: cli.md
+  - Troubleshooting: troubleshooting.md
+  - Measurements: measurements.md
+  - Development:
+      - Architecture: architecture.md
+      - Decisions:
+          - Overview: decisions/index.md
+          - Native evidence: decisions/0001-native-evidence-and-controlled-runners.md
+          - Sampling and dispatch: decisions/0002-fixed-samples-and-durable-dispatch.md
+          - Fresh baselines: decisions/0003-strict-fresh-baselines.md
+          - Fuzz confirmation: decisions/0004-single-finding-fuzz-confirmation.md
+          - Repair grading: decisions/0005-cooperative-repair-grading.md
+          - Context comparison: decisions/0006-explicit-context-comparison.md
+      - Research:
+          - Overview: research/index.md
+          - Feasibility: research/feasibility.md
+          - Reduction design: research/reduction-design.md
+          - Ordinary-session investigation: research/ordinary-session-investigation.md
+          - Passive compaction investigation: research/passive-compaction-investigation.md
+          - Context fuzzing: research/context-fuzzing.md
+          - Comparative debugging design: research/comparative-debugging.md
+      - Roadmap: https://github.com/andyrossa/llm-context-packer/blob/main/ROADMAP.md
+# Navigation alone does not restrict which files MkDocs publishes.
+exclude_docs: |
+  *
+  !/index.md
+  !/agent-skill.md
+  !/native-runs.md
+  !/reduction.md
+  !/fuzzing.md
+  !/comparison.md
+  !/results.md
+  !/cli.md
+  !/troubleshooting.md
+  !/measurements.md
+  !/third-party-notices.txt
+  !/architecture.md
+  !/decisions/*.md
+  !/research/*.md
+  !/branding/ithrl-logo-light.svg
+  !/branding/ithrl-logo-dark.svg
+  !/branding/ithrl-icon.svg
+  !/branding/ithrl-favicon.svg
+  !/branding/ithrl-logo.png
+  !/branding/ithrl-social.png
+  !/branding/branding.css
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
