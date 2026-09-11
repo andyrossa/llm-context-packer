@@ -1,0 +1,626 @@
+"""Codex final-response runner composed with the shared isolated runtime."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from contextlib import suppress
+from importlib.metadata import version as distribution_version
+from pathlib import Path
+from typing import cast
+
+from ithrl.behavior import MAX_BEHAVIOR_TEXT_LENGTH
+from ithrl.context import JsonObject, JsonValue, content_digest
+from ithrl.execution import CapabilityProfile
+from ithrl.experiment import CodexReplayConfig
+from ithrl.runner.codex.configuration import CodexProviderConfiguration
+from ithrl.runner.codex.isolation import (
+    CodexIsolationError,
+    CodexRuntime,
+    prepare_codex_process,
+    program_digest,
+)
+from ithrl.runner.codex.materialize import (
+    CodexMaterialization,
+    CodexMaterializationError,
+    CodexMaterializationErrorCode,
+    materialize_codex_attempt,
+    validate_codex_output_limit,
+)
+from ithrl.runner.codex.policy import (
+    CAPTURE_TYPE,
+    CONTEXT_OPERATIONS,
+    CONTINUATION_INSTRUCTIONS,
+    MATERIALIZATION,
+    POLICY_VERSION,
+    RECONSTRUCTION_METHOD,
+    RUNNER_VERSION,
+    SOURCE_SCHEMA,
+    TARGET_TYPE,
+    configuration_deviation,
+    runtime_deviation,
+)
+from ithrl.runner.codex.protocol import CodexProtocolError, ProtocolOutcome
+from ithrl.runner.codex.protocol_contracts import MAX_INFERENCE_REQUESTS
+from ithrl.runner.codex.runtime_configuration import validate_runner_configuration
+from ithrl.runner.codex.transcript import parse_transcript, physical_request_counts
+from ithrl.runner.contracts import (
+    MAX_MODEL_NAME_LENGTH,
+    MAX_SERVICE_TIER_LENGTH,
+    CandidateInvalidError,
+    NativeOutputReference,
+    PreparedAttempt,
+    ProviderAcceptanceState,
+    RunAccounting,
+    RunnerCancelled,
+    RunnerError,
+    RunnerErrorCode,
+    RunResult,
+    TokenUsage,
+)
+from ithrl.runner.runtime import (
+    PROCESS_CANCELLATION_GRACE_SECONDS,
+    NativeOutputStoreError,
+    ProcessRuntimeCancelled,
+    ProcessRuntimeError,
+    ProtectedOutputStore,
+    ProtectedPath,
+    RuntimeReport,
+    run_isolated_process,
+)
+from ithrl.runner.runtime.protection import (
+    DEFAULT_MAX_PROTECTED_BYTES,
+    DEFAULT_MAX_PROTECTED_ENTRIES,
+)
+from ithrl.runner.validation import validate_run_result
+
+WORKSPACE_PROTECTION_POLICY = "internal-relative-links-v1"
+
+
+class CodexRunner:
+    """Execute one reconstructed Codex turn with every action surface disabled."""
+
+    def __init__(
+        self,
+        *,
+        capability_profile: CapabilityProfile,
+        runtime: CodexRuntime,
+        configuration: CodexProviderConfiguration,
+        codex_replay: CodexReplayConfig | None = None,
+        state_parent: Path,
+        output_root: Path,
+        source_paths: Iterable[ProtectedPath],
+        workspace_paths: Iterable[ProtectedPath],
+    ) -> None:
+        _validate_capability(capability_profile)
+        _validate_configuration(capability_profile, configuration, runtime)
+        if codex_replay is not None and codex_replay.provider != capability_profile.provider:
+            raise ValueError("Codex replay provider does not match its capability profile")
+        sources = tuple(source_paths)
+        workspaces = tuple(workspace_paths)
+        if not sources or not workspaces:
+            raise ValueError("Codex runner requires protected source and workspace paths")
+        state_root = state_parent.resolve(strict=False)
+        absolute_output_root = output_root.absolute()
+        resolved_output_root = absolute_output_root.resolve(strict=False)
+        protected_roots = tuple(
+            entry.path.resolve(strict=False) for entry in (*sources, *workspaces)
+        )
+        if _paths_overlap(state_root, resolved_output_root) or any(
+            _paths_overlap(owned, protected)
+            for owned in (state_root, resolved_output_root)
+            for protected in protected_roots
+        ):
+            raise ValueError("Codex runner storage overlaps protected state")
+        self._capability = capability_profile
+        self._runtime = runtime
+        self._configuration = configuration
+        self._codex_replay = codex_replay
+        self._client_version = distribution_version("ithrl")
+        self._worker_source = Path(__file__).with_name("worker.py")
+        self._worker_digest = program_digest(self._worker_source)
+        support_sources = tuple(
+            Path(__file__).with_name(name)
+            for name in ("protocol.py", "protocol_contracts.py", "relay.py")
+        )
+        self._support_programs = tuple(
+            (source, program_digest(source)) for source in support_sources
+        )
+        self._state_parent = state_root
+        self._output_store = ProtectedOutputStore.open(absolute_output_root)
+        self._source_paths = sources
+        self._workspace_paths = workspaces
+
+    @property
+    def capability_profile(self) -> CapabilityProfile:
+        return self._capability
+
+    @property
+    def fingerprint(self) -> str:
+        identity = {
+            "runner": "codex",
+            "runner_version": RUNNER_VERSION,
+            "client_version": self._client_version,
+            "capability": self._capability.digest,
+            "materialization": self._capability.reconstruction_method,
+            "policy": POLICY_VERSION,
+            "continuation_instructions": CONTINUATION_INSTRUCTIONS,
+            "workspace_protection": WORKSPACE_PROTECTION_POLICY,
+            "provider_configuration": self._configuration.public_digest,
+            "runtime": self._runtime.identity,
+            "worker": self._worker_digest,
+            "support_programs": {source.name: digest for source, digest in self._support_programs},
+        }
+        if self._codex_replay is not None:
+            identity["codex_replay"] = self._codex_replay.model_dump()
+        return f"codex-v{RUNNER_VERSION}:{content_digest(identity)}"
+
+    def validate_candidate(self, attempt: PreparedAttempt) -> None:
+        """Check source-backed reconstruction without runtime or provider operations."""
+
+        try:
+            if attempt.execution_plan.codex_replay != self._codex_replay:
+                raise CodexMaterializationError(
+                    CodexMaterializationErrorCode.INCOMPATIBLE_CASE,
+                    "Codex replay does not match the selected runner",
+                )
+            materialized = materialize_codex_attempt(attempt)
+            _validate_materialized_identity(materialized, attempt)
+            validate_codex_output_limit(materialized, self._configuration.tool_output_token_limit)
+        except CodexMaterializationError as error:
+            changed = (
+                attempt.candidate.removed_context_ids or not attempt.candidate.mutation.is_empty
+            )
+            if changed and error.code in {
+                CodexMaterializationErrorCode.MISSING_TRIGGER,
+                CodexMaterializationErrorCode.UNSUPPORTED_CONTEXT,
+            }:
+                raise CandidateInvalidError("candidate cannot be reconstructed") from error
+            raise
+
+    async def run(
+        self, attempt: PreparedAttempt, *, runtime_deadline: float | None = None
+    ) -> RunResult:
+        """Execute one prepared source-backed final-response attempt."""
+
+        self._validate_attempt(attempt)
+        try:
+            materialized = materialize_codex_attempt(attempt)
+            _validate_materialized_identity(materialized, attempt)
+            validate_codex_output_limit(materialized, self._configuration.tool_output_token_limit)
+        except CodexMaterializationError as error:
+            raise RunnerError(
+                RunnerErrorCode.PREPARATION,
+                str(error),
+                provider_acceptance_state=ProviderAcceptanceState.NOT_STARTED,
+                model_requested=attempt.execution_plan.model_requested,
+                provider=self._capability.provider,
+                endpoint=self._capability.endpoint,
+                effective_policy_digest=attempt.safety_policy.digest,
+            ) from error
+
+        worker_request = _worker_request(
+            materialized,
+            self._configuration.provider_id,
+            self._client_version,
+            endpoint=self._configuration.endpoint,
+            max_requests=attempt.execution_plan.capability.provider_calls_per_attempt,
+            timeout_seconds=attempt.resource_limits.max_wall_time_seconds,
+            max_response_bytes=attempt.resource_limits.max_native_output_bytes,
+        )
+        try:
+            execution = await run_isolated_process(
+                attempt_id=attempt.attempt_id,
+                state_parent=self._state_parent,
+                output_store=self._output_store,
+                prepare=lambda state: prepare_codex_process(
+                    state,
+                    runtime=self._runtime,
+                    configuration=self._configuration,
+                    request=worker_request,
+                    worker_source=self._worker_source,
+                    worker_digest=self._worker_digest,
+                    support_programs=self._support_programs,
+                ),
+                resource_limits=attempt.resource_limits,
+                source_paths=self._source_paths,
+                workspace_paths=self._workspace_paths,
+                max_protected_entries=DEFAULT_MAX_PROTECTED_ENTRIES,
+                max_protected_bytes=DEFAULT_MAX_PROTECTED_BYTES,
+                runtime_deadline=runtime_deadline,
+                allow_internal_workspace_symlinks=True,
+            )
+        except ProcessRuntimeCancelled as cancelled:
+            error = _runtime_error(
+                attempt,
+                RunnerErrorCode.CANCELLED,
+                "Codex attempt was cancelled",
+                cancelled.report,
+                cancelled.native_output,
+                output_store=self._output_store,
+            )
+            raise RunnerCancelled(error) from None
+        except ProcessRuntimeError as error:
+            raise _runtime_error(
+                attempt,
+                error.code,
+                str(error),
+                error.report,
+                error.native_output,
+                output_store=self._output_store,
+                reason_code=error.reason_code,
+            ) from error
+        except CodexIsolationError as error:
+            raise RunnerError(
+                RunnerErrorCode.PREPARATION,
+                str(error),
+                provider_acceptance_state=ProviderAcceptanceState.NOT_STARTED,
+                model_requested=attempt.execution_plan.model_requested,
+                provider=self._capability.provider,
+                endpoint=self._capability.endpoint,
+                effective_policy_digest=attempt.safety_policy.digest,
+            ) from error
+
+        if execution.native_output is None:
+            raise _runtime_error(
+                attempt,
+                RunnerErrorCode.CONTRACT,
+                "Codex runner produced no protected native output",
+                execution.report,
+                None,
+                output_store=self._output_store,
+            )
+        try:
+            protected = self._output_store.read(execution.native_output)
+            outcome = parse_transcript(protected.stdout)
+        except (CodexProtocolError, NativeOutputStoreError) as error:
+            raise _runtime_error(
+                attempt,
+                RunnerErrorCode.PROTOCOL,
+                "Codex runner output could not be validated",
+                execution.report,
+                execution.native_output,
+                output_store=self._output_store,
+                reason_code=error.code
+                if isinstance(error, CodexProtocolError)
+                else "native-output-unavailable",
+            ) from error
+        _require_normalized_outcome(attempt, outcome, execution.report, execution.native_output)
+        if execution.returncode != 0 or outcome.status != "completed":
+            raise _outcome_error(attempt, outcome, execution.report, execution.native_output)
+
+        result = _run_result(attempt, outcome, execution.report, execution.native_output)
+        validate_run_result(attempt, result)
+        return result
+
+    def _validate_attempt(self, attempt: PreparedAttempt) -> None:
+        try:
+            self._runtime.assert_unchanged()
+            programs_unchanged = program_digest(self._worker_source) == self._worker_digest and all(
+                program_digest(source) == digest for source, digest in self._support_programs
+            )
+        except CodexIsolationError as error:
+            raise RunnerError(
+                RunnerErrorCode.PREPARATION,
+                "Codex runner inputs changed after capability detection",
+            ) from error
+        if not programs_unchanged:
+            raise RunnerError(
+                RunnerErrorCode.PREPARATION,
+                "Codex runner inputs changed after capability detection",
+            )
+        plan = attempt.execution_plan
+        if (
+            plan.capability != self._capability
+            or plan.runner_fingerprint != self.fingerprint
+            or plan.codex_replay != self._codex_replay
+        ):
+            raise RunnerError(
+                RunnerErrorCode.CONTRACT,
+                "Codex runner does not match the resolved execution plan",
+            )
+        if attempt.safety_policy.provider_transport != "allowed":
+            raise RunnerError(
+                RunnerErrorCode.SAFETY,
+                "Codex provider transport is not allowed by the resolved policy",
+            )
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _validate_capability(capability: CapabilityProfile) -> None:
+    expected = {
+        "runner_type": "codex",
+        "runner_version": RUNNER_VERSION,
+        "harness": "codex",
+        "source_schema": SOURCE_SCHEMA,
+        "deterministic": False,
+        "supported_capture_types": (CAPTURE_TYPE,),
+        "supported_materializations": (MATERIALIZATION,),
+        "supported_context_operations": CONTEXT_OPERATIONS,
+        "reconstruction_method": RECONSTRUCTION_METHOD,
+        "supported_targets": (TARGET_TYPE,),
+        "provider_transport": "required",
+        "tool_network_access": "forbidden",
+        "action_visibility": "not-applicable",
+        "action_denial": "enforced",
+        "action_execution": "denied",
+        "source_store_effect": "unchanged",
+        "original_workspace_effect": "unchanged",
+        "protected_state_enforcement": "preventive",
+        "disposable_state_effect": "writes",
+        "disposable_state_limit_enforcement": "enforced",
+        "process_containment": "process-group",
+        "supports_timeout": True,
+        "supports_cancellation": True,
+        "cancellation_grace_seconds": PROCESS_CANCELLATION_GRACE_SECONDS,
+        "reports_usage": True,
+        "input_token_limit_enforcement": "unavailable",
+    }
+    if (
+        type(capability.provider_calls_per_attempt) is not int
+        or not 1 <= capability.provider_calls_per_attempt <= MAX_INFERENCE_REQUESTS
+    ):
+        raise ValueError("Codex capability does not satisfy the final-response runner contract")
+    document = capability.model_dump(mode="python")
+    if any(document[name] != value for name, value in expected.items()):
+        raise ValueError("Codex capability does not satisfy the final-response runner contract")
+    if capability.provider is None or capability.endpoint is None:
+        raise ValueError("Codex capability requires a verified provider destination")
+
+
+def _validate_configuration(
+    capability: CapabilityProfile,
+    configuration: CodexProviderConfiguration,
+    runtime: CodexRuntime,
+) -> None:
+    validate_runner_configuration(
+        configuration.rendered_config,
+        endpoint=configuration.endpoint,
+        environment_names=configuration.environment_names,
+    )
+    if (
+        capability.provider != configuration.source_provider_id
+        or capability.endpoint != configuration.endpoint
+        or configuration_deviation(configuration.public_digest) not in capability.deviations
+        or runtime_deviation(runtime.identity) not in capability.deviations
+    ):
+        raise ValueError("Codex provider configuration does not match its capability profile")
+
+
+def _validate_materialized_identity(
+    materialized: CodexMaterialization,
+    attempt: PreparedAttempt,
+) -> None:
+    capability = attempt.execution_plan.capability
+    if materialized.model != attempt.execution_plan.model_requested:
+        raise CodexMaterializationError(
+            code=CodexMaterializationErrorCode.INCOMPATIBLE_CASE,
+            message="the selected Codex model differs from the execution plan",
+        )
+    if materialized.provider != capability.provider:
+        raise CodexMaterializationError(
+            code=CodexMaterializationErrorCode.INCOMPATIBLE_CASE,
+            message="the selected Codex provider differs from the execution plan",
+        )
+
+
+def _worker_request(
+    materialized: CodexMaterialization,
+    runtime_provider_id: str,
+    client_version: str,
+    *,
+    endpoint: str,
+    max_requests: int,
+    timeout_seconds: int,
+    max_response_bytes: int,
+) -> JsonObject:
+    return {
+        "schema_version": 1,
+        "client_version": client_version,
+        "model": materialized.model,
+        "provider": runtime_provider_id,
+        "effort": materialized.effort,
+        "personality": materialized.personality,
+        "baseInstructions": materialized.base_instructions,
+        "developerInstructions": materialized.developer_instructions,
+        "history": cast(JsonValue, list(materialized.history)),
+        "input": cast(JsonValue, list(materialized.turn_input.items)),
+        "checkpointContinuation": materialized.turn_input.checkpoint_continuation,
+        "transport": {
+            "endpoint": endpoint,
+            "max_requests": max_requests,
+            "timeout_seconds": timeout_seconds,
+            "max_response_bytes": max_response_bytes,
+        },
+    }
+
+
+def _run_result(
+    attempt: PreparedAttempt,
+    outcome: ProtocolOutcome,
+    report: RuntimeReport,
+    native_output: NativeOutputReference,
+) -> RunResult:
+    if outcome.usage is None or outcome.final_text is None:
+        raise RunnerError(RunnerErrorCode.CONTRACT, "Codex completed without required evidence")
+    return RunResult(
+        attempt_id=attempt.attempt_id,
+        effective_policy_digest=attempt.safety_policy.digest,
+        final_text=outcome.final_text,
+        model_requested=attempt.execution_plan.model_requested,
+        model_returned=outcome.model_returned,
+        provider=attempt.execution_plan.capability.provider,
+        endpoint=attempt.execution_plan.capability.endpoint,
+        service_tier=outcome.service_tier,
+        usage=_token_usage(outcome),
+        accounting=_accounting(report, outcome),
+        native_output=native_output,
+    )
+
+
+def _require_normalized_outcome(
+    attempt: PreparedAttempt,
+    outcome: ProtocolOutcome,
+    report: RuntimeReport,
+    native_output: NativeOutputReference,
+) -> None:
+    error: tuple[RunnerErrorCode, str] | None = None
+    returned_model = None
+    if outcome.final_text is not None and len(outcome.final_text) > MAX_BEHAVIOR_TEXT_LENGTH:
+        error = (
+            RunnerErrorCode.OUTPUT_LIMIT,
+            "Codex final response exceeds the normalized text limit",
+        )
+    elif (
+        outcome.model_returned is not None
+        and not 0 < len(outcome.model_returned) <= MAX_MODEL_NAME_LENGTH
+    ) or (
+        outcome.service_tier is not None
+        and not 0 < len(outcome.service_tier) <= MAX_SERVICE_TIER_LENGTH
+    ):
+        error = (
+            RunnerErrorCode.PROTOCOL,
+            "Codex returned invalid model identity metadata",
+        )
+    elif (
+        attempt.execution_plan.codex_replay is not None
+        and outcome.model_returned is not None
+        and outcome.model_returned != attempt.execution_plan.model_requested
+    ):
+        error = (
+            RunnerErrorCode.PROTOCOL,
+            "Codex returned a different model from the replay selection",
+        )
+        returned_model = outcome.model_returned
+    if error is None:
+        return
+    raise RunnerError(
+        *error,
+        provider_acceptance_state=ProviderAcceptanceState(outcome.provider_acceptance),
+        model_requested=attempt.execution_plan.model_requested,
+        model_returned=returned_model,
+        provider=attempt.execution_plan.capability.provider,
+        endpoint=attempt.execution_plan.capability.endpoint,
+        usage=_token_usage(outcome),
+        accounting=_accounting(report, outcome),
+        native_output=native_output,
+        effective_policy_digest=attempt.safety_policy.digest,
+    )
+
+
+def _token_usage(outcome: ProtocolOutcome) -> TokenUsage | None:
+    if outcome.usage is None:
+        return None
+    return TokenUsage(
+        input_tokens=outcome.usage.input_tokens,
+        output_tokens=outcome.usage.output_tokens,
+        cached_input_tokens=outcome.usage.cached_input_tokens,
+    )
+
+
+def _outcome_error(
+    attempt: PreparedAttempt,
+    outcome: ProtocolOutcome,
+    report: RuntimeReport,
+    native_output: NativeOutputReference,
+) -> RunnerError:
+    if outcome.error_code == "provider-overloaded":
+        code = RunnerErrorCode.PROVIDER_OVERLOADED
+    elif outcome.error_code == "provider-call-limit":
+        code = RunnerErrorCode.PROVIDER_CALL_LIMIT
+    elif outcome.error_code in {
+        "action-requested",
+        "remote-control-active",
+        "unintercepted-action",
+        "unsupported-server-request",
+    }:
+        code = RunnerErrorCode.SAFETY
+    else:
+        code = RunnerErrorCode.PROTOCOL
+    acceptance = ProviderAcceptanceState(outcome.provider_acceptance)
+    return RunnerError(
+        code,
+        "Codex final-response execution did not produce a valid completion",
+        provider_acceptance_state=acceptance,
+        model_requested=attempt.execution_plan.model_requested,
+        model_returned=outcome.model_returned,
+        provider=attempt.execution_plan.capability.provider,
+        endpoint=attempt.execution_plan.capability.endpoint,
+        service_tier=outcome.service_tier,
+        usage=_token_usage(outcome),
+        accounting=_accounting(report, outcome),
+        native_output=native_output,
+        effective_policy_digest=attempt.safety_policy.digest,
+        behavior_output_observed=outcome.behavior_output_observed,
+        reason_code=outcome.error_code,
+    )
+
+
+def _runtime_error(
+    attempt: PreparedAttempt,
+    code: RunnerErrorCode,
+    message: str,
+    report: RuntimeReport,
+    native_output: NativeOutputReference | None,
+    *,
+    output_store: ProtectedOutputStore | None = None,
+    reason_code: str | None = None,
+) -> RunnerError:
+    physical_counts = (0, 0) if report.process_outcome == "not-started" else None
+    if output_store is not None and native_output is not None:
+        with suppress(NativeOutputStoreError):
+            physical_counts = physical_request_counts(output_store.read(native_output).stdout)
+    acceptance = (
+        ProviderAcceptanceState.NOT_STARTED
+        if physical_counts == (0, 0)
+        else ProviderAcceptanceState.UNKNOWN
+    )
+    return RunnerError(
+        code,
+        message,
+        reason_code=reason_code,
+        provider_acceptance_state=acceptance,
+        model_requested=attempt.execution_plan.model_requested,
+        provider=attempt.execution_plan.capability.provider,
+        endpoint=attempt.execution_plan.capability.endpoint,
+        accounting=_accounting(report, physical_counts=physical_counts),
+        native_output=native_output,
+        effective_policy_digest=attempt.safety_policy.digest,
+    )
+
+
+def _accounting(
+    report: RuntimeReport,
+    outcome: ProtocolOutcome | None = None,
+    *,
+    physical_counts: tuple[int, int] | None = None,
+) -> RunAccounting:
+    provider_calls_started = (
+        outcome.provider_calls_started
+        if outcome is not None
+        else (physical_counts[0] if physical_counts is not None else 0)
+    )
+    return RunAccounting(
+        provider_calls_started=provider_calls_started,
+        provider_calls_completed=(
+            outcome.provider_calls_completed
+            if outcome is not None
+            else (physical_counts[1] if physical_counts is not None else 0)
+        ),
+        provider_connections_started=provider_calls_started,
+        actions_requested=outcome.actions_requested if outcome is not None else 0,
+        actions_denied=outcome.actions_denied if outcome is not None else 0,
+        elapsed_milliseconds=report.elapsed_milliseconds,
+        native_output_bytes=report.native_output_bytes,
+        disposable_state_bytes=report.disposable_state_bytes,
+        residual_disposable_state_bytes=report.residual_disposable_state_bytes,
+        disposable_state_entries=report.disposable_state_entries,
+        residual_disposable_state_entries=report.residual_disposable_state_entries,
+        process_outcome=report.process_outcome,
+        forced_termination=report.forced_termination,
+        cleanup_outcome=report.cleanup_outcome,
+        source_store_effect=report.source_store_effect,
+        original_workspace_effect=report.original_workspace_effect,
+    )
