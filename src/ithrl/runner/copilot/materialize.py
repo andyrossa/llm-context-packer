@@ -1,0 +1,299 @@
+"""Reconstruct GitHub Copilot native prefixes from preserved source evidence."""
+
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Never
+
+from ithrl.adapters import AdapterError
+from ithrl.adapters.contracts import NativeSession
+from ithrl.adapters.registry import decision_input_node_id, parse_session_bytes
+from ithrl.case import CaseFormatError
+from ithrl.context import ContextNode, JsonObject, JsonValue, content_digest
+from ithrl.extraction import validate_extracted_case
+from ithrl.mutation import MutationError, TextAppend, append_message_text, message_text
+from ithrl.runner.contracts import PreparedAttempt, _validate_attempt_identities
+from ithrl.runner.copilot.policy import CAPTURE_TYPE, MATERIALIZATION, SOURCE_SCHEMA
+from ithrl.text_sections import (
+    TextSectionCatalog,
+    TextSectionError,
+    TextSectionRemoval,
+    remove_text_sections,
+)
+
+_SOURCE_PATH = "source/events.jsonl"
+_MAX_NATIVE_SESSION_BYTES = 64 * 1024 * 1024
+
+
+class CopilotMaterializationErrorCode(StrEnum):
+    """Stable failure categories for source-backed Copilot reconstruction."""
+
+    INCOMPATIBLE_CASE = "incompatible-case"
+    CHANGED_EVIDENCE = "changed-evidence"
+    UNSUPPORTED_CONTEXT = "unsupported-context"
+    MISSING_TRIGGER = "missing-trigger"
+    AMBIGUOUS_BOUNDARY = "ambiguous-boundary"
+
+
+class CopilotMaterializationError(RuntimeError):
+    """A Copilot candidate cannot be reconstructed without changing its meaning."""
+
+    def __init__(self, code: CopilotMaterializationErrorCode, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class CopilotMaterialization:
+    """Private native restore input; None marks genuinely uncaptured system guidance."""
+
+    native_session: bytes = field(repr=False)
+    session_id: str
+    system_message: str | None = field(repr=False)
+
+
+def materialize_copilot_attempt(attempt: PreparedAttempt) -> CopilotMaterialization:
+    """Overlay one candidate on the immutable prefix through its native turn start."""
+
+    if any(
+        not isinstance(edit, (TextAppend, TextSectionRemoval))
+        for edit in attempt.candidate.mutation.edits
+    ):
+        _unsupported("Copilot reconstruction requires a supported text intervention")
+    _validate_compatible_attempt(attempt)
+    try:
+        session = validate_extracted_case(attempt.evidence)
+    except CaseFormatError:
+        raise CopilotMaterializationError(
+            CopilotMaterializationErrorCode.CHANGED_EVIDENCE,
+            "the preserved Copilot evidence no longer matches the case",
+        ) from None
+    try:
+        _validate_attempt_identities(attempt)
+    except ValueError:
+        if any(isinstance(edit, TextSectionRemoval) for edit in attempt.candidate.mutation.edits):
+            raise CopilotMaterializationError(
+                CopilotMaterializationErrorCode.CHANGED_EVIDENCE,
+                "the Copilot candidate does not match its evidence and execution plan",
+            ) from None
+        _unsupported("the Copilot candidate does not match its evidence and execution plan")
+    decision = attempt.evidence.decision
+    if session is None or decision is None or decision.selector.source != _SOURCE_PATH:
+        raise CopilotMaterializationError(
+            CopilotMaterializationErrorCode.INCOMPATIBLE_CASE,
+            "the case has no supported Copilot source artifact",
+        )
+    native_session, session_id = _materialize_session(attempt, session)
+    # Release the original parse before independently validating the reconstructed prefix.
+    del session
+    try:
+        candidate_session = parse_session_bytes(native_session)
+    except AdapterError:
+        _unsupported("the retained Copilot context has invalid native relationships")
+    candidate_records = candidate_session.records
+    _validate_complete_tool_work(candidate_records)
+    return CopilotMaterialization(
+        native_session=native_session,
+        session_id=session_id,
+        system_message=_captured_system_message(candidate_records),
+    )
+
+
+def _validate_compatible_attempt(attempt: PreparedAttempt) -> None:
+    evidence = attempt.evidence
+    manifest = evidence.manifest
+    decision = evidence.decision
+    if (
+        attempt.candidate.materialization != MATERIALIZATION
+        or manifest.harness != "copilot"
+        or manifest.source_schema != SOURCE_SCHEMA
+        or manifest.capture.request != CAPTURE_TYPE
+        or decision is None
+        or decision.selector.kind != "copilot-assistant-message"
+        or attempt.target.type not in {"final-response", "shell-action"}
+    ):
+        raise CopilotMaterializationError(
+            CopilotMaterializationErrorCode.INCOMPATIBLE_CASE,
+            "the case is not a supported Copilot decision",
+        )
+    if (
+        any(isinstance(edit, TextSectionRemoval) for edit in attempt.candidate.mutation.edits)
+        and attempt.target.type != "final-response"
+    ):
+        _unsupported("text-section removal requires a final-response target")
+    if (
+        any(isinstance(edit, TextAppend) for edit in attempt.candidate.mutation.edits)
+        and attempt.candidate.removed_context_ids
+    ):
+        _unsupported("text mutation requires the unchanged original context")
+
+
+def _materialize_session(
+    attempt: PreparedAttempt,
+    session: NativeSession,
+) -> tuple[bytes, str]:
+    decision = attempt.evidence.decision
+    if decision is None:
+        _ambiguous("the Copilot case has no selected decision")
+    records = session.records
+    boundary = decision.selector.context_before_line
+    retained = frozenset(attempt.candidate.retained_context_ids)
+    selected = _selected_context(attempt.evidence.context.nodes, records, boundary, retained)
+    try:
+        fixed_input = decision_input_node_id(
+            session, decision.selector, attempt.evidence.context, records=records
+        )
+    except AdapterError:
+        raise CopilotMaterializationError(
+            CopilotMaterializationErrorCode.AMBIGUOUS_BOUNDARY,
+            "the selected Copilot decision has no supported native input boundary",
+        ) from None
+    if fixed_input not in retained:
+        raise CopilotMaterializationError(
+            CopilotMaterializationErrorCode.MISSING_TRIGGER,
+            "the candidate removes the native input for the selected decision",
+        )
+    edit = next(iter(attempt.candidate.mutation.edits), None)
+    if edit is not None and not isinstance(edit, (TextAppend, TextSectionRemoval)):
+        _unsupported("Copilot reconstruction requires a supported text intervention")
+    catalog = None
+    if edit is not None:
+        if edit.context_id == fixed_input:
+            raise CopilotMaterializationError(
+                CopilotMaterializationErrorCode.MISSING_TRIGGER,
+                "mutation cannot change the current decision input",
+            )
+        eligible = {site.context_id for site in attempt.evidence.editable_text()}
+        if edit.context_id not in eligible:
+            _unsupported("mutation requires an editable prior user message")
+        if isinstance(edit, TextSectionRemoval):
+            try:
+                catalog = attempt.evidence.validate_text_sections(edit)
+            except MutationError:
+                _unsupported("section removal does not match the effective prior user text")
+    raw_lines = session.native_bytes.splitlines(keepends=True)
+    output = [
+        _mutate_record(raw_lines[line - 1], record, edit, catalog)
+        if edit is not None and node_id == edit.context_id
+        else raw_lines[line - 1]
+        for line, node_id, record in selected
+    ]
+    # The existing model-turn boundary is retained; no user input or target output is invented.
+    output.append(raw_lines[boundary - 1])
+    native_session = b"".join(output)
+    if len(native_session) > _MAX_NATIVE_SESSION_BYTES:
+        _unsupported("the reconstructed Copilot native prefix exceeds the byte limit")
+    return native_session, session.metadata.session_id
+
+
+def _selected_context(
+    nodes: tuple[ContextNode, ...],
+    records: tuple[JsonObject, ...],
+    boundary: int,
+    retained: frozenset[str],
+) -> list[tuple[int, str, JsonObject]]:
+    if len(nodes) != boundary - 1:
+        _ambiguous("the Copilot context graph does not match the selected boundary")
+    selected = []
+    for line, node in enumerate(nodes, start=1):
+        record = records[line - 1]
+        selector = node.selector
+        if (
+            selector is None
+            or selector.line != line
+            or selector.identity_key != "id"
+            or selector.identity_value != record.get("id")
+            or node.source != _SOURCE_PATH
+            or node.digest != content_digest(record)
+        ):
+            _ambiguous("the Copilot context graph does not match its source records")
+        if node.id in retained:
+            selected.append((line, node.id, record))
+    return selected
+
+
+def _mutate_record(
+    raw: bytes,
+    record: JsonObject,
+    edit: TextAppend | TextSectionRemoval,
+    catalog: TextSectionCatalog | None,
+) -> bytes:
+    record = copy.deepcopy(record)
+    data = _object(record.get("data"))
+    effective_field = "transformedContent" if "transformedContent" in data else "content"
+    try:
+        message: JsonObject = {"role": "user", "content": data.get(effective_field)}
+        if isinstance(edit, TextAppend):
+            changed = append_message_text(message, edit)
+            data[effective_field] = changed["content"]
+        else:
+            if catalog is None:
+                _unsupported("section removal requires its original field catalog")
+            data[effective_field] = remove_text_sections(
+                message_text(message, edit.content_index), catalog, edit
+            )
+    except (MutationError, TextSectionError):
+        _unsupported("mutation does not match the effective prior user text")
+    ending = b"\r\n" if raw.endswith(b"\r\n") else b"\n" if raw.endswith(b"\n") else b""
+    try:
+        encoded = json.dumps(
+            record, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode()
+    except (UnicodeError, ValueError):
+        _unsupported("mutation cannot be encoded as a native Copilot record")
+    return encoded + ending
+
+
+def _validate_complete_tool_work(records: tuple[JsonObject, ...]) -> None:
+    requests: set[str] = set()
+    starts: set[str] = set()
+    completions: set[str] = set()
+    for record in records:
+        data = _object(record.get("data"))
+        if record.get("type") == "assistant.message":
+            tools = data.get("toolRequests")
+            if isinstance(tools, list):
+                requests.update(
+                    str(request["toolCallId"]) for request in tools if isinstance(request, dict)
+                )
+        elif record.get("type") == "tool.execution_start":
+            starts.add(str(data["toolCallId"]))
+        elif record.get("type") == "tool.execution_complete":
+            completions.add(str(data["toolCallId"]))
+    if requests != starts or requests != completions:
+        _unsupported("the retained Copilot context contains incomplete tool work")
+
+
+def _captured_system_message(records: tuple[JsonObject, ...]) -> str | None:
+    for record in reversed(records):
+        if record.get("type") != "system.message":
+            continue
+        data = _object(record.get("data"))
+        if data.get("role", "system") != "system":
+            continue
+        content = data.get("content")
+        if not isinstance(content, str):
+            _unsupported("the captured Copilot system message has unsupported content")
+        return content
+    return None
+
+
+def _object(value: JsonValue | None) -> JsonObject:
+    return value if isinstance(value, dict) else {}
+
+
+def _unsupported(message: str) -> Never:
+    raise CopilotMaterializationError(
+        CopilotMaterializationErrorCode.UNSUPPORTED_CONTEXT,
+        message,
+    ) from None
+
+
+def _ambiguous(message: str) -> Never:
+    raise CopilotMaterializationError(
+        CopilotMaterializationErrorCode.AMBIGUOUS_BOUNDARY,
+        message,
+    )
