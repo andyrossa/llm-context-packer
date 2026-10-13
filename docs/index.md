@@ -1,0 +1,54 @@
+# ithrl documentation
+
+<!-- rumdl-disable MD033 -->
+<div class="ithrl-wordmark">
+  <img class="ithrl-logo-light" src="branding/ithrl-logo-light.svg" alt="ithrl" width="280" height="138">
+  <img class="ithrl-logo-dark" src="branding/ithrl-logo-dark.svg" alt="ithrl" width="280" height="138">
+</div>
+<!-- rumdl-enable MD033 -->
+
+`ithrl` turns saved coding-agent sessions into debugging experiments. Find a smaller context that
+preserves a selected behavior, test a text append that changes it, or compare two selected contexts.
+Passive compaction inspection reads recorded operations and results without model calls.
+
+## Start here
+
+- **Learn the workflow:**
+    [install ithrl](https://github.com/andyrossa/llm-context-packer/blob/main/README.md#install) and
+    [run the bundled example](https://github.com/andyrossa/llm-context-packer/blob/main/README.md#try-it). It needs
+    no agent installation or model access and shows the expected output.
+- **Use your own session:** [select a saved decision](native-runs.md#select-a-saved-decision),
+    [prepare a reduction](reduction.md) and review its provider, safety
+    controls and budget. The [fuzzing walkthrough](fuzzing.md) covers text
+    appends.
+- **Inspect compaction without model calls:**
+    [compare recorded operations and captured results](results.md#inspect-recorded-compaction) in
+    one saved session.
+- **Compare selected contexts:** [declare a repair or degradation comparison](comparison.md),
+    calibrate both contexts and confirm their effect with fresh observations.
+- **Investigate a result:** use [Results and privacy](results.md) for the workflow's saved files,
+    inspection commands and outcome interpretation. The
+    [worked reduction](research/ordinary-session-investigation.md) shows what retained context can
+    tell you.
+
+## Reference and background
+
+- [CLI reference](cli.md): commands, arguments, options and defaults generated from the CLI.
+- [Results and privacy](results.md): saved files, preservation, resource usage, resume and private
+  data handling.
+- [Troubleshooting](troubleshooting.md): selection, setup, refusal and resume problems.
+- [Measurements](measurements.md): benchmark construction, outcomes and costs.
+
+For development context, see [architecture](architecture.md), [decision records](decisions/index.md)
+and [research](research/index.md). The
+[roadmap](https://github.com/andyrossa/llm-context-packer/blob/main/ROADMAP.md) links future direction to the
+public issue tracker. The [Project board](https://github.com/users/andyrossa/projects/1/views/4) shows
+work status and dependencies.
+
+For help or a proposed change, see [Support](https://github.com/andyrossa/llm-context-packer/blob/main/SUPPORT.md).
+Report suspected vulnerabilities through
+[private vulnerability reporting](https://github.com/andyrossa/llm-context-packer/security/advisories/new).
+Contributor setup and checks are in
+[Contributing](https://github.com/andyrossa/llm-context-packer/blob/main/CONTRIBUTING.md).
+
+The site's theme, fonts and browser assets have [third-party notices](third-party-notices.txt).
