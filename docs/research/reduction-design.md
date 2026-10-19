@@ -1,0 +1,598 @@
+# Sampled reduction design research
+
+Sampled reduction uses exploratory candidate screening followed by one independent fresh
+confirmation of a durably selected candidate. The design studies rejected eager baseline prefetch,
+measured a limited synthetic benefit from lazy sharing, and retained strict fresh baselines in
+production. This page records their methods, numerical results and failed alternatives.
+
+Study budgets and native layouts describe the evaluated workloads. Use
+[native reduction](../reduction.md) for current operator settings,
+[measurements](../measurements.md) for native results and costs, and [results](../results.md)
+to interpret output.
+[ADR 0003](../decisions/0003-strict-fresh-baselines.md) records the baseline decision.
+
+## Method and confidence convention
+
+Confirmation uses the uncorrected independent-arm Wilson hybrid-score interval, **Newcombe
+method 10**. Let arm 1 be the candidate and arm 2 the immutable original, with valid matches
+`x_i`, valid counts `n_i > 0`, `q_i = x_i/n_i`, nominal one-sided confidence `C`,
+`z = Phi^-1(C)` and `s = z*z`:
+
+```text
+center_i = (q_i + s/(2*n_i)) / (1 + s/n_i)
+half_i = z * sqrt(q_i*(1-q_i)/n_i + s/(4*n_i*n_i)) / (1 + s/n_i)
+l_i = center_i - half_i
+u_i = center_i + half_i
+d = q_1 - q_2
+L = d - sqrt((q_1-l_1)^2 + (u_2-q_2)^2)
+U = d + sqrt((u_1-q_1)^2 + (q_2-l_2)^2)
+```
+
+There is no continuity correction, pooling, pseudocount or Wald substitution. At `C=.95`,
+both bounds use `Phi^-1(.95)`: the corresponding central interval has coefficient `.90`.
+This is nominal approximate confidence, not an exact finite-sample guarantee. Preservation
+uses the lower bound for `p(candidate)-p(original)` and the declared degradation margin.
+
+The [SAS FREQ specification](https://support.sas.com/documentation/onlinedoc/stat/132/freq.pdf)
+(printed page 2675) supplies the square-and-add formula; its
+[noninferiority documentation](https://support.sas.com/documentation/cdl/en/procstat/68142/PDF/default/procstat.pdf)
+(printed page 182) supplies the central `1-2*alpha` convention. The independent comparator was
+[statsmodels `0.15.0`](https://github.com/statsmodels/statsmodels/blob/v0.15.0/statsmodels/stats/proportion.py),
+with explicit candidate-first `method="newcomb"`, `compare="diff"` and
+`alpha=2*(1-C)`. Forty independently generated vectors remain in
+[the public fixture](https://github.com/andyrossa/llm-context-packer/blob/main/tests/fixtures/statistics_reference.json).
+Production agreement was within `1e-12`; full count-table maximum absolute difference was
+`3.33e-16`, and 81 scaled cases differed by at most `2.22e-16`. Analytic endpoint identities
+and arm-swap symmetry were also checked. Formula agreement alone does not establish error rates.
+
+The [original Newcombe paper record](https://pubmed.ncbi.nlm.nih.gov/9595617/) identifies the 1999
+erratum, *Statistics in Medicine* 18(10):1293, DOI
+`10.1002/(SICI)1097-0258(19990530)18:10<1293::AID-SIM175>3.0.CO;2-7`. The correction clarifies that
+**method 11** must use the first square-and-add expression because its second expression is not
+equivalent. Method 10's two expressions are equivalent; paired-data definitions are unaffected. The
+correction does not change the method implemented here.
+
+## Original joint gate and its failure
+
+The planted benchmark has four dependency-valid editable groups: one behavioral instruction
+and three irrelevant histories, at each of four instruction positions. Useful success requires
+retaining the instruction, removing at least 50% of editable materialized bytes, completing the
+final sweep and passing independent confirmation. Initial stationary independent match rates
+were `.90` for original/retained context and `.10` after instruction removal. The gate required
+at least 80% workflow success at every position, a `.20` degradation margin, `.95` one-sided
+confirmation and fit within a 512-call comparison envelope. A two-hour command horizon was
+another planning constraint. These were joint usefulness/cost targets, not a promise about
+arbitrary ordinary-session behavior.
+
+The initial fixed-confirmatory search study enumerated 198 allocation/confidence/margin settings.
+The diagnostic rate grid included endpoints, near endpoints, margin boundaries, reflected
+rates and unequal arms. At `.95` confidence, the engineering error ceiling was `.055`
+(`alpha + min(.005,.10*alpha)`), including false preservation, boundary preservation and false
+loss. Passing this finite grid never established uniform error control over unknown true rates.
+
+False preservation means accepting a candidate whose true degradation exceeds the margin. False
+loss means rejecting one whose true degradation is within the margin. Boundary preservation is
+acceptance when the true degradation equals the margin; the study checks that case separately.
+
+| Equal confirmation samples per arm | Preservation power at `.90/.90` | Worst tested error event | Passed error grid |
+| --- | ---: | ---: | --- |
+| 20 | 63.09% | 7.004% | No |
+| 40 | 88.83% | 5.869% | No |
+| 50 | 93.66% | 5.981% | No |
+| 80 | 99.22% | 5.758% | No |
+| 100 | 99.82% | 5.280% | Yes |
+
+Only four initial settings passed every declared stress point: original/candidate counts,
+confidence, margin `(5,5,.99,.20)`, `(10,10,.95,.20)`, `(50,50,.95,.10)` and
+`(50,50,.99,.10)`. With eligible 100/arm confirmation, the affordable margin-.20 search
+settings achieved only 0.517–0.520% workflow success for 5/arm at `.99`, or 25.784–33.131%
+for 10/arm at `.95`. Required one-call/two-call budgets were 262/524 and 322/644. Neither
+met the 80% usefulness gate or the two-call 512 limit. These probabilities conditioned on
+successful calibration and all-valid observations; calibration readiness was not yet modeled.
+
+A frozen follow-up tested 72 statistical settings, 11 confirmation settings and 288 statistical
+search/confirmation combinations. Farrington–Manning and Miettinen–Nurminen confirmation at
+40/arm passed the `.055` finite grid, with `.90/.90` powers 86.69%/86.63% and worst tested
+errors 5.366%/5.081%. Even the nine combinations meeting error, confirmation-power and at least
+one call-profile screen achieved at best 16.67% minimum workflow success. Neither alternative
+was added to production. This bounded failure does not prove all counts or methods infeasible.
+
+The score-method comparison used independent constrained-likelihood maximization: 23,900 count pairs
+agreed within `2.86e-13`, and six upstream R vectors agreed at their published tolerances. The
+comparison tolerance was fixed before gate evaluation. The pinned statsmodels score path had a
+known nonzero-difference maximum-likelihood estimation defect,
+so it was not used as the score oracle. See the
+[upstream correction](https://github.com/statsmodels/statsmodels/pull/10270) and
+[pinned reference tests](https://github.com/statsmodels/statsmodels/blob/5cc7275739c4a03d023a1f7ac29e16274b61e961/statsmodels/stats/tests/test_proportion.py#L1514-L1567).
+
+## Exploratory screening and a separate holdout
+
+The adopted search screen admits a complete eligible removal when the candidate-minus-original point
+estimate is at least `-margin`. It attaches no preservation confidence or minimality claim to that
+action. One candidate is selected durably without confirmation feedback; fresh original and
+candidate arms then test it. Search never resumes after selection, and failed confirmation cannot
+trigger reselection or repeated testing until a pass. The
+[sample-splitting argument](https://academic.oup.com/biomet/article/110/3/597/6955603) motivates
+independent selection/confirmation; it does not prove Newcombe coverage, provider independence,
+historical causality or campaign-wide confidence.
+
+In the original six-comparison conditional workload, a 4-original/5-candidate point-estimate
+screen with fresh 100/100 confirmation achieved **86.32%** minimum success and fit 256/512
+one-call/two-call budgets. Its position probabilities were `.8631725339`, `.9189502698`,
+`.9189744495`, `.9266704484`. A 4/4 point screen achieved 60.68%; the `.80` Newcombe loss-veto
+screen achieved 79.62% at 4/4 and 79.37% at 4/5. Those 79% outcomes failed the 80% gate.
+Larger 8/8 and 12/12 point screens reached 82.27%/91.76% but required 596/692 two-call budgets.
+Only the 4/5 point screen met the then-current conditional usefulness/cost gate for both profiles.
+
+This favorable result was narrow: minimum success fell to 42.05% for `.90/.80` original/retained
+rates and 22.63% for `.50/.50`. Worst cap exhaustion was 10.41%, and instruction removal 3.20%.
+Requiring two `.90`-rate calibration matches would multiply the conditional minimum by `.81`,
+giving 69.92%. With no confirmation replacement slack, even 1% independent invalidity gives
+only `.99^200=13.40%` probability of collecting all confirmation observations. These findings
+required an unconditional workflow model before integration.
+
+## Budget and failure-tolerance studies
+
+The next frozen programme evaluated 312 named plans, including calibration readiness, incomplete
+arms, cap exhaustion, complete selection and independent confirmation. It relaxed the original
+512-call/two-hour development constraints and reported the resulting costs. Confirmation at 100
+and 200 per arm passed the 150-point diagnostic grid:
+
+| Confirmation per arm | Maximum false preservation | Boundary preservation | False loss | Power `.90/.90` | Power `.50/.50` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 100 | 5.0957% | 5.2799% | 4.7908% | 99.8168% | 88.5420% |
+| 200 | 5.1263% | 5.3548% | 5.0219% | 99.9999% | 99.2908% |
+
+| Calibration valid/minimum matches; search original/candidate; confirmation per arm | Maximum attempts / conservative two-call budget | Useful success `.90/.90`, failures 0% / 1% | `.90/.80`, 0% / 1% | `.50/.50`, 0% / 1% |
+| --- | ---: | ---: | ---: | ---: |
+| 3/2; 3/5; 100; no extras | 251 / 502 | 80.95% / 6.50% | 38.65% / 3.10% | 6.79% / 0.55% |
+| 3/2; 40/40; 100; eligibility-limited extras | 717 / 1,434 | 96.85% / 84.62% | 52.79% / 46.12% | 38.26% / 33.43% |
+| 10/2; 80/80; 200; eligibility-limited extras | 1,438 / 2,876 | 99.998% / 88.71% | 82.70% / 73.36% | 96.70% / 85.79% |
+
+Each probability is the minimum unconditional useful success across positions. Failures here
+are independently replaceable safe preaccept exclusions. The original 5% excluded-attempt
+cutoff sharply reduced completion near its boundary without proving outcome independence.
+At 5% failures, the best original-workload plan in that family achieved only 2.6774% success.
+
+A 224-plan follow-up replaced that arbitrary fraction cutoff with fixed attempt ceilings sized
+before outcomes. The displayed plans used a 10% planning failure rate and `.999` per-arm
+completion target. The small plan (calibration 3/minimum 2, search 4/5, confirmation 100/arm)
+used ceilings 7, 8/9 and 124/arm: 357 attempts/714 conservative two-call budget. Minimum success
+was 83.8754% at 5% failures and 83.1356% at 10%. The large plan (10/minimum 2, 80/80,
+200/arm) used 1,694 attempts/3,388 calls and achieved 99.9974%/98.8117% for `.90/.90`,
+82.7006%/81.7200% for `.90/.80`, and 96.7022%/95.5556% for `.50/.50`. The old large-plan
+5% cutoff control achieved only 0.02805% at 5% failures despite a 2,876-call budget.
+
+Under this safe-preaccept model, failures have zero provider calls; conservative reservations
+still cover every permitted attempt. The small/large model-specific provider-call upper bounds
+were 514/2,740. They are distinct from the 714/3,388 admission budgets, actual calls and time.
+The maximum complete-search false-confirmation probability in the frozen scenarios remained
+2.208678%; it is not a uniform error bound. Known outcome-dependent exclusions remain a refusal.
+
+## Baseline sharing: failed prefetch and useful conditional design
+
+The first sharing study retained strict sampling. Its main cost stage used 200,000 repetitions
+in each of 24 stationary cells (4.8 million simulated workflows). Eager sibling-cohort policies
+prefetched candidate work that could become unnecessary after an accepted removal. Fixed-six
+one-call budgets were small strict/cohort-2/cohort-4 **357/333/325**, and large
+**1,694/1,394/1,294**. Only large/cohort-4 met the initial arbitrary 20% fixed-budget threshold.
+Actual adaptive costs showed why that arithmetic was insufficient:
+
+| Instruction position | Strict mean calls | Eager cohort-4 mean calls | Discarded-prefetch mean calls |
+| --- | ---: | ---: | ---: |
+| 0 | 1,369.9940 | 1,209.9984 | 0.0008 |
+| 1 | 1,210.0012 | 1,209.9984 | 80.0060 |
+| 2 | 1,209.9980 | 1,210.0008 | 80.0048 |
+| 3 | 1,050.0012 | 1,210.0040 | 160.0048 |
+
+At position 3, simultaneous cost bounds demonstrated at least **136.7484 additional expected
+calls**, with comparable completed useful work. Adaptive worst-path allowances were larger
+than fixed-six arithmetic: small strict/cohort-2/cohort-4 357/376/403 and large
+1,694/1,894/2,194. Cost rejection stopped adoption evaluation: the full 8,632-tail risk family
+was not run. The 13-scenario, 200-replicate pilot was descriptive, not risk qualification.
+
+The follow-up prospectively removed the unjustified 20% and benefit-at-every-position rules.
+Its objective was **expected total charged calls / unconditional probability of a confirmed
+useful reduction**, using ratios of weighted expectations rather than averages of cell ratios.
+The frozen mixture equally weighted positions and two byte shapes, `128/128/128/128` and
+`128/128/256/512`; these weights describe a synthetic benchmark, not user traffic. Lazy sharing
+froze sibling order and membership, sampled the original and first candidate, then sampled a
+second sibling only after retention. Acceptance or parent change ended reuse. Confirmation
+always remained fresh.
+
+The 280-cell stationary finite-sum study produced:
+
+| Configuration | Expected charged calls | Useful probability | Calls per useful result | Minimum equal mildly degraded success |
+| --- | ---: | ---: | ---: | ---: |
+| Large strict 80/80 | 1,209.997946 | 99.998767% | 1,210.012860 | 82.701140% |
+| Large lazy group 2 | 1,129.996461 | 99.998767% | 1,130.010389 | 82.701140% |
+| Large lazy group 4 | 1,129.996461 | 99.998767% | 1,130.010389 | 82.701140% |
+| Strict 40 original / 80 candidate | 1,009.984239 | 99.993138% | 1,010.053544 | 79.650861% |
+
+Group 2 saved **80.002471 calls per useful result (6.611704%)**. Group 4 added only about
+`6.9e-9` calls of benefit, below numerical allowances. The simpler strict 40/80 allocation saved
+16.525388% on the primary workload but missed the 80% mildly degraded position-0 floor by
+0.349139 percentage points.
+
+A prospective operational study compared large strict and lazy group 2: seed `2026100707`,
+20,000 replicas per cell, 11 scenarios, two shapes and four positions. Its first run stopped
+at the 120-second resource ceiling with no completed report. Removing duplicate simulation of
+the two byte shapes preserved every outcome stream and criterion; the successful run took
+76.675 seconds internally. The 176 scored cells reused 1,760,000 policy workflows; 3,520,000
+shape scores were not independent samples. Simultaneous coverage used `.01/10,000` tails,
+exact-binomial endpoints and bounded-mean Hoeffding cost limits.
+
+Healthy calls per useful result were 1,210.000 strict versus 1,130.001 lazy. Simultaneous
+envelopes `[1,178.517669,1,242.340213]` and `[1,100.377130,1,160.426187]` resolved at least
+18.091482 fewer calls. With 5% safe failures they were 1,273.706 versus 1,189.497. Mildly
+degraded results were 1,420.764 versus 1,321.107 without failures and 1,499.915 versus
+1,394.180 with 5%; minimum lazy usefulness lower bounds were 81.709704% and 81.324039%.
+
+Expiry was a decisive limit. With an exclusive lifetime of 240 synthetic dispatch slots, all
+20,000 lazy workflows at each of positions 0–2 expired without confirmation; only position 3
+succeeded. Aggregate useful probability was 25%, giving **1,960 calls per useful result**
+despite smaller raw consumption of 490 attempts; strict remained 1,210. A compatible seven-slot
+pause retained benefit, while stale resume refused after 11 charged attempts without a
+behavioral-loss classification. Synthetic slots do not establish freshness in native seconds.
+
+For the declared independent constant-rate fresh-confirmation model, the maximum component
+error plus allowance was `.053547757881` and factorized additional selected-result risk upper
+bound `.001837546839`, below `.055`/`.005` gates. Realized intervals were weaker: 12/176
+paired-publication upper bounds exceeded `.005`; all 64 realized conditional-error upper
+bounds were unresolved, with 288 empty selected-null categories. Qualification used the
+prospectively declared independent component factorization, not those unresolved intervals.
+Drift within confirmation, unknown provider rates and uniform coverage remain unqualified.
+
+The result selected lazy groups of two as a useful **synthetic** design. Production sharing
+remained disabled pending native savings, finite freshness admission and composed ownership/
+resume validation. It did not justify an epoch framework or a default change.
+
+## Native-layout budget study
+
+Actual native message encodings changed the search path/budget calculation. The four-group
+layout with the small plan and a ten-comparison cap achieved only 77.2418%, 77.2038% and
+76.1337% minimum modeled usefulness at 0%, 5% and 10% independent safe preaccept failures.
+The failure-free position-0 cap-exhaustion probability was 14.8483%. A prospectively frozen
+comparison of caps 14 and 20 selected **14**, the smallest tested pass: 91.5047%, 91.4589%,
+90.1717%. Twenty added about `.00013` percentage points at the worst position.
+
+That configuration reserves `7 + 14*(8+9) + 2*124 = 493` attempts. Its measured profiles allowed
+493 calls for final response or 986 for Copilot shell. The arithmetic protects fresh confirmation;
+it does not predict consumption. Three successful runs each used ten comparisons and 293 attempts.
+Their 75% editable-byte removal and 100/100 confirmation matches per arm appear in the
+[synthetic reduction reference](../measurements.md#synthetic-reduction-reference).
+
+The modeled usefulness rates apply to this planted layout and its small search samples. They do
+not establish an envelope for ordinary sessions, noisy targets or mild degradation. The
+[saved-session measurements](../measurements.md#saved-session-experiments) evaluate different
+workloads and configurations, including a larger search sample on Codex. Current per-attempt
+request bounds also differ from these historical call allowances.
+
+100k execution remains unqualified. Larger source preparations and pure reconstruction establish
+neither execution capacity nor token or monetary savings at that scale. No native comparison
+established baseline-sharing savings, so strict fresh baselines remain the production policy.
+
+## Failed and interrupted native predecessors
+
+The accepted runs did not erase unsuccessful predecessors. The retained historical aggregate
+record includes these separately bounded experiments; it is not a random sample of campaigns.
+Call columns distinguish known starts, additional possible calls and pending reservations.
+Pending dispatches in interrupted runs were never permission to replay them.
+
+| Profile / stop reason | Known / additional possible / pending calls | Conservative charge | Whole-command time |
+| --- | --- | ---: | ---: |
+| Codex initial interruption; search and confirmation incomplete | 56 / 0 / 0 | 56 | 287.19 s |
+| Codex HTTP 503 during confirmation | 158 / 0 / 0 | 158 | 835.44 s |
+| Copilot final response interrupted during confirmation | 150 / 0 / 1 | 151 | 1,422.58 s |
+| Copilot shell interrupted during confirmation | 141 / 141 / 2 | 284 | 1,251.47 s |
+| Codex `usageLimitExceeded`; search incomplete | 45 / 0 / 0 | 45 | 216.85 s |
+| Codex `responseTooManyFailedAttempts`, HTTP 429; search incomplete | 9 / 0 / 0 | 9 | 53.42 s |
+| Codex same structured error with HTTP 429; separate search | 21 / 0 / 0 | 21 | 131.15 s |
+| Copilot shell optional-metadata rejection in calibration | 1 / 1 / 0 | 2 | 12.14 s |
+| Codex later user interruption | 111 / 0 / 0 | 111 | 2,276.26 s |
+| Codex paced structured overload; search incomplete | 23 / 0 / 0 | 23 | 514.71 s |
+
+The HTTP 503 and interrupted Copilot runs completed their searches but lacked complete eligible
+confirmation. They supply no preservation verdict. Controls also exposed two validity boundaries: a
+completed tool-free response under a shell target is a valid nonmatch, and optional informational
+metadata must not invalidate an otherwise proved completed outcome. Completion, action visibility
+and action-denial requirements remain strict. No behavioral conclusion follows from a protocol
+error.
+
+The 429 errors supplied neither a reset time nor a retry delay and did not distinguish allowance
+exhaustion from request-rate throttling. Usage exhaustion, generic HTTP 503 and structured overload
+require separate handling. These costs explain why successful-run duration alone cannot estimate
+campaign cost, and repeated successful runs cannot recover the original nominal error claim.
+
+## Overload replacement: separate safety and inference limits
+
+Pacing alone does not eliminate external failures. A paced run retained a structured
+`serverOverloaded` error with `willRetry:false`, no captured assistant/reasoning/tool output,
+verified cleanup and unchanged protected state. Acceptance remained unknown. That bounded
+no-output category motivated the separate eligibility policy below.
+
+The prospectively frozen opt-in `safe-provider-overload` policy permits a new attempt only for
+that structured no-output category with exact provenance, enforced action denial and verified
+safety/cleanup. Generic 429/503, transport failure, timeout, cancellation, quota exhaustion and
+malformed events keep their terminal handling. The failed observation and full conservative
+charge remain; unknown acceptance remains unknown. A replacement has a new identity within
+the existing arm ceiling and consumes existing call/time/freshness capacity. It never resolves
+an unknown dispatch by replay or repeats completed confirmation. The default remains
+`independent-safe-preaccept-only`.
+
+Its estimand is `P(match | valid, frozen plan)`. With independent stationary joint draws of
+validity and behavior and a prespecified validity rule, the first fixed number of valid outcomes
+has that conditional distribution, including conditional arm completion within the fixed
+ceiling. Within-draw independence of validity and behavior is not required for this conditional
+estimand. Between-attempt dependence, drift or outcome-driven replacement invalidates the
+argument. Preservation does not establish equal reliability or all-attempt match probability.
+Accepted overloads were not modeled in the native-layout simulation, and the successful Codex
+qualification used **no overload replacement**.
+
+## Text-section workload preparation
+
+This section preserves the original [#44](https://github.com/andyrossa/llm-context-packer/issues/44) preparation
+proposal, which collected no new model observations. The
+[shared section contract](../architecture.md#source-bound-text-sections) defines the deterministic
+`paragraph-v1` policy. Exact ordinary source text, identities, fixed input, predicates, section
+selections and proposal digest remain private. These settings are historical, not current execution
+instructions. [Issue #46](https://github.com/andyrossa/llm-context-packer/issues/46) records later workload
+decisions; [measurements](../measurements.md#ordinary-session-paragraph-removal) records completed
+qualification with revised sources and a 512-byte criterion.
+
+| Workload | Debugging question and predicate scope | Prepared surface | Minimum additional removal |
+| --- | --- | --- | ---: |
+| Ordinary Codex CI diagnosis | Which earlier context preserves an observed recommendation to change upstream authentication material? A fixed literal marker detects that recommendation, not the correctness of all advice or a unique cause. | A newly extracted source has mixed prior-user fields of 576 and 178 UTF-8 bytes, partitioned into four and two sections. No historical coarse result exists for this source. | 64 UTF-8 bytes |
+| Ordinary Copilot deployment diagnosis | Does the answer still mention the initial provisioning failure after generic troubleshooting preamble is removed? The fixed marker detects mention, not platform root cause or correctness of recovery advice. | A historical 181-to-111-record coarse candidate retains a 7,135-byte field with 28 sections. Its search was incomplete; its old confirmation does not qualify the current native-prefix profile. | 256 UTF-8 bytes |
+
+The proposal required coarse search to retain at least one selected Codex field with both relevant
+and potentially removable paragraphs. Earlier ordinary reductions retained only short single-purpose
+fields and were excluded. Loss of both mixed fields would be a limiting outcome, not permission to
+split words, substitute an easier source after seeing outcomes, or relabel unchanged input as an
+existing coarse reduction. Copilot also required fresh current-profile controls and coarse search;
+its historical result supplied selection evidence only.
+
+Source, predicate, paragraph policy, fields and traversal order had to be frozen before collection.
+Fine removal preserved the Codex task goal and no-mutation restriction if their parent survived;
+coarse search received no extra protection. The exact coarse candidate and stopping state were
+saved before fine search. Each fine candidate could remove multiple sections from one retained
+field, without accumulating edits across fields.
+
+Additional reduction counted only eligible UTF-8 text bytes relative to the coarse candidate,
+excluding record deletion, JSON envelopes and fixed input. The 64-byte Codex threshold admitted
+either 88/90-byte paragraph from its smaller field; Copilot's 256-byte threshold required more
+removal from its larger field. Neither promised preservation.
+
+Debugging value requires a concrete developer conclusion, a next investigation and remaining
+uncertainties; a matching literal alone is insufficient. The proposal separated structural
+reduction, behavioral confirmation, debugging value and full-workflow cost. Final-versus-original
+token comparisons required returned usage; a coarse/fine comparison required both measurements
+within the allowance. Unknown usage remained unknown; byte reduction did not establish token or
+monetary savings.
+
+The frozen cost proposal allocated eight coarse and eight fine comparison blocks per workload.
+Unused coarse comparisons do not enlarge the fine allowance. Coarse search stops at the first
+completed algorithm sweep, eight admitted complete comparisons, or refusal of the next whole block
+while protecting confirmation capacity. An unfinished sweep remains incomplete, without a
+minimality claim. Fine search makes one durable final selection, followed by one fresh independent
+confirmation against the full immutable original. It never uses the coarse candidate as the
+inferential baseline or uses holdout outcomes to resume search or select again.
+
+| Phase | Valid targets | Maximum attempts per workload |
+| --- | --- | ---: |
+| Controls | Two unchanged-original and two empty-edit round trips, with fixed input, action denial and safety verified | 4 |
+| Calibration | Three valid observations, at least two target matches | 3 |
+| Coarse and fine exploratory search | Two valid original and two valid candidate observations per comparison | 16 × (3 + 3) = 96 |
+| Fresh confirmation | Twenty valid observations per arm | 30 + 30 = 60 |
+| Total | Controls and calibration do not enter search or confirmation denominators | 163 |
+
+Exploratory admission uses candidate-minus-original point difference at least `-0.20` and makes no
+confidence claim. Confirmation uses the existing Newcombe method 10 with degradation margin `0.20`
+and nominal one-sided confidence `0.95`. Twenty observations per arm is a bounded proposal, not a
+promise of adequate power, uniform coverage or useful completion on these ordinary workloads.
+The default `independent-safe-preaccept-only` eligibility policy applies; overload replacement is
+not enabled. Failed controls, insufficient calibration, incomplete confirmation and limiting
+outcomes remain reportable; they do not authorize retries until a pass.
+
+The proposed caps were 16 calls per Codex attempt and one per Copilot attempt: 2,608 and 163 per
+workflow. These were planning bounds, not measured requirements; unenforceable bounds required
+reassessment. Attempts allowed 120 seconds, three seconds cancellation grace and five seconds
+pacing: at most 20,049 runner seconds and 815 pacing seconds per workload, within eight wall hours
+and 24-hour freshness.
+
+Confirmation reserved 60 attempts, 7,380 runner seconds and 960 Codex or 60 Copilot calls, plus
+pacing. Controls, errors, incomplete work, actual calls, additional possible calls and pending
+reservations remained charged. Historical timings could not guarantee completion.
+
+The proposal authorized no native probes or provider calls. Execution required a separate freeze
+of implementation, runtime, model, provider, reconstruction and safety policy, enforceable limits
+and live-run approval. Revised budgets or criteria had to be frozen before affected observations,
+while retaining earlier failures and limiting outcomes.
+
+### Input auditing and limits of attribution
+
+Audit the reconstructed history, instructions and fixed input separately from source records.
+An event-log duplicate that survives as metadata need not enter native history. Identify visible
+information carriers, opaque items, editable prior-user fields and protected inputs at each accepted
+coarse checkpoint. This provider-free audit establishes what the runner constructs; it does not
+establish what the provider accepts, renders or uses internally.
+
+[ContextCite (Cohen-Wang et al., NeurIPS 2024)](https://papers.nips.cc/paper_files/paper/2024/file/adbea136219b64db96a9941e4249a857-Paper-Conference.pdf)
+studies attribution through context ablations. It distinguishes information that contributes to
+a generation from information that merely supports the statement, and discusses pretraining,
+redundant sources and dependencies between sources. These limits motivate checking alternative
+information carriers before interpreting a deletion. A preserved predicate after removing one
+field does not establish that its information is absent, that the advice is correct or that the
+field was necessary in the historical generation.
+
+[Zeller and Hildebrandt (2002)](https://www.cs.columbia.edu/~junfeng/08fa-e6998/sched/readings/delta-debug-input.pdf)
+make decomposition into removable units part of the debugging method and distinguish unresolved
+tests from passing and failing outcomes. Here, conclusions remain conditional on the supported edit
+domain and eligible observations. Exploratory sampled admissions establish neither necessity nor
+minimality; interruptions and runner errors remain unresolved evidence.
+
+The [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning) documents
+opaque reasoning items that can carry state between requests under supported model and context
+settings. Presence in a reconstructed payload alone cannot establish compatible acceptance,
+rendering or influence for a captured native profile. Record opaque items without inferring their
+contents or treating an absent visible marker as proof that the information is unavailable.
+
+Before proposing another workload, identify a concrete debugging question, a fixed behavioral
+specification and mixed prior-user fields within the supported edit domain. Record alternative
+visible carriers and opaque-state uncertainty. This screening cannot prove coarse retention; that
+eligibility gate still requires observation. If useful retained information lies outside the edit
+domain, report a scope question. Do not protect the selected field artificially, lower the frozen
+threshold or silently substitute another source. The optional
+[field-loss stopping rule](../reduction.md#optional-section-removal-settings) can avoid further
+comparisons once all selected fields are removed; it supplies no positive qualification evidence.
+
+## Prospective ordinary-workflow cohort
+
+The [bounded cohort study](https://github.com/andyrossa/llm-context-packer/issues/16) asked whether ordinary
+saved sessions yield useful debugging investigations beyond the previously selected examples.
+Its two measured workloads calibrated successfully, but neither retained the selected field
+through coarse search. The study produced no additional confirmed investigation.
+
+### Selection and eligibility
+
+The protocol preceded conversation-content inspection. It sampled the local Codex and Copilot
+stores captured and last modified before **2026-11-17 00:00 UTC**. Each harness contributed eight
+recent sources, captured from November 7 inclusive, and four older sources, ranked within each
+stratum by a frozen hash seed. Sources were not ranked by outcome or replaced after exclusion.
+A metadata-read allowance was increased before selection when the first inventory hit its bound;
+the cutoff, seed, strata and cohort size were unchanged. The
+[frozen method and exclusions](https://github.com/andyrossa/llm-context-packer/issues/16#issuecomment-6942564925)
+record the exact ranking, bounds and retained incomplete inventory.
+
+| Stage | Codex | Copilot |
+| --- | ---: | ---: |
+| Eligible logical sessions in the local frame | 3,788 | 101 |
+| Selected and snapshotted | 12 | 12 |
+| Experimental parser accepted, including nonordinary sources | 12 | 8 |
+| Ordinary engineering sources | 2 | 8 |
+| Ordinary sources accepted by parser | 2 | 4 |
+| Ordinary parsed sources with completed final-response targets | 2 | 3 |
+| Prospective predicate and section-removal packages | 1 | 3 |
+| Primary workloads receiving native controls and calibration | 1 | 1 |
+| Selected fields surviving the measured coarse stage | 0 | 0 |
+
+Ten Codex selections were spawned-task or approval-review sessions. Copilot exclusions comprised
+three administrative sessions and one synthetic control. Four ordinary Copilot sources were
+parser-refused: three missing-turn-ID cases and one turn/tool-relationship failure. One parsed
+ordinary Copilot source had no completed final-response target. A bounded decision screen found
+no supported predicate/intervention package for the other ordinary Codex source. Two additional
+Copilot packages passed provider-free materialization but received no native execution; their
+behavior remains unassessed. These are workstation-cohort counts, not population rates.
+
+Neither primary source recorded compaction markers or images. One secondary Copilot source had
+two compaction markers before its selected decision and remained unexecuted. Those markers alone
+establish neither historical input delivery nor experimental reconstruction eligibility.
+
+### Measured outcome and developer conclusion
+
+The primaries asked whether a shorter record could retain a configured documentation-link
+identifier or a checksum-repair command mention. These lexical predicates detect mention, not
+correctness, endorsement or repair success. Quoted or negated mentions can pass; paraphrases can
+fail. The paid experiments used a private candidate wheel with Codex CLI `0.169.0` and Copilot
+CLI `1.0.107` / SDK `1.0.28`, on Python `3.12.3`. Earlier Codex input controls used an isolated
+mock destination; Copilot controls captured native
+requests before inference forwarding. Calibration then used the real providers. These controls
+checked reconstructed requests, not historical request equivalence or provider-internal use.
+
+Each primary collected three matching pilot observations, then three fresh calibration matches
+in its bounded investigation. The first coarse comparison collected one matching original and
+one matching candidate observation. Its exploratory point screen admitted removal of 47 Codex
+or 14 Copilot case-context units, including the selected field. Six Copilot candidates were
+refused by pure admission before comparison; these consumed no model observations or calls.
+
+The prospective field-loss rule stopped both runs at the completed comparison boundary. Neither
+tested its frozen 832-byte or 556-byte section edit, met the additional **512-byte** criterion,
+or entered fresh confirmation. Earlier observations supplied no confirmation credit. Both saved
+results passed offline retained-context inspection, with verified cleanup, unchanged protected
+state, no executed actions and no tool-network effects. The
+[reviewed outcomes](https://github.com/andyrossa/llm-context-packer/issues/16#issuecomment-6950495903) retain the
+trial classifications and execution evidence.
+
+A developer can inspect the shorter coarse records and their surviving evidence as hypotheses.
+They are not confirmed reproducers. One matching candidate observation does not establish
+preservation, field necessity, historical cause or minimality. The fine edits remain behaviorally
+untested; their lost eligibility here does not negate the earlier qualified examples. Removing a
+field also does not establish that its information is absent from other visible or opaque inputs.
+
+### Cost and implications
+
+The paid pilot and investigations used **16 attempts and 16 completed inference requests**:
+12 calibration observations and four exploratory observations, with no invalid observations,
+runner errors, additional possible calls or pending reservations in those stages. Prerequisite
+native controls encountered startup/protocol, session-restore, authentication and TLS failures.
+They forwarded no external model inference, but remain part of the investigation's preparation
+cost; the 16-attempt total does not describe all native invocations or overall reliability.
+
+| Harness | Inference requests | Reported input tokens | Reported output tokens | Combined CLI wall time |
+| --- | ---: | ---: | ---: | ---: |
+| Codex | 8 | 1,191,335 | 7,143 | 221 s |
+| Copilot | 8 | 431,481 | 7,785 | 304 s |
+
+These totals include every paid attempt, not just candidate observations. Copilot also reported
+270,795 cached-input tokens, a subset of input tokens. Its optional counters do not qualify
+general telemetry coverage or change the profile's `reports_usage=False` declaration. Token
+counts establish neither monetary cost nor confirmed reduction savings. Authentication and
+metadata traffic are separate and partly uncounted.
+
+Full investigation cost remains unknown: recorded preparation intervals do not cover all native
+compatibility diagnosis, review and publication, human effort or assistant-authoring inference.
+The linked issue preserves failed controls, partial timings and missing data. Execution latency
+alone therefore does not establish an affordable ordinary debugging workflow or context envelope.
+
+The result limits the usefulness claim for this selection: neither chosen field survived the
+normal coarse traversal, so finer reduction could not be evaluated. It does not establish how
+often this occurs for other workloads. Further paid work on these fields is unwarranted without
+a distinct prospective question and eligibility argument. Artificial protection, a lower byte
+threshold or outcome-based source replacement would change the experiment. The separate
+[comparison design](https://github.com/andyrossa/llm-context-packer/issues/13) and
+[tool-output assessment](https://github.com/andyrossa/llm-context-packer/issues/74) can use the retained evidence;
+this study qualifies neither capability and adds no public support claim.
+
+The follow-up [public benchmark design](https://github.com/andyrossa/llm-context-packer/issues/81) assesses
+constructed debugging tasks with real Codex/Copilot traces, independently checked outcomes and
+context-dependence controls. It addresses reproducibility beyond private sessions and the limits
+of mention-based grading. Its prospective task selection and cost recording remain separate from
+this frozen cohort; constructed-task results would not establish ordinary-workflow success rates.
+
+## Reproducibility and remaining limits
+
+The [reduction study package](https://github.com/andyrossa/llm-context-packer/tree/main/research/reduction)
+contains the executed eager-prefetch cost stage, all 280 stationary sharing/allocation cells,
+the 176 scored operational rows and the native-layout budget enumeration. Its reference algorithms
+are independent of application changes. Configurations, seeds, source identities and result
+comparisons make the scope of each replay explicit. See the package guide for short verification
+and full replay commands.
+
+The package also supplies an independent finite evaluation of the selected screening, confirmation
+and attempt-ceiling decisions. It matches 44 documented summary values, checks 48 workflow
+calculations against a separate enumerator, and verifies 24 admission probabilities with exact
+rational binomial sums. Its declared diagnostic domain contains 127 feasible rate pairs; the six
+confirmation sample sizes reproduce the reported finite-grid maxima. It does not enumerate the full
+earlier allocation sweeps or evaluate the alternative score methods.
+
+The 40 independent formula vectors, statistical unit/property tests, sampling and recovery tests,
+harness fixtures and native aggregate measurements provide additional checks of the implemented
+contracts. Synthetic replay does not reproduce native model outcomes or establish the frequency
+of useful results on ordinary sessions.
+
+Exact finite binomial/path enumeration was used where affordable; Monte Carlo is identified for the
+sharing operational studies. Independent formula vectors, numerical agreement, workflow usefulness,
+operational validity and live safety answer different questions. For Monte Carlo, prospective family
+sizes and simultaneous exact-binomial bounds controlled simulation uncertainty; they did not make
+the behavioral interval exact. See
+[NIST's exact-binomial bounds](https://itl.nist.gov/div898/software/dataplot/refman2/auxillar/exacbino.htm).
+The
+[NIST sample-size approximation](https://www.itl.nist.gov/div898/handbook/prc/section2/prc242.htm)
+was planning context, not validation of the classifier or defaults.
+
+Alternative-method research also did not establish a shortcut:
+[Shan, Lou and Wu (2023)](https://link.springer.com/article/10.1007/s44199-023-00054-8) reported
+regime-dependent performance; the
+[Hawila–Berg exact-corrected proposal](https://arxiv.org/abs/2104.04660v3) was challenged on
+monotonicity/coherence in a [2024 comment](https://arxiv.org/abs/2404.08352). Changing the method
+would require demonstrated error, numerical and workload-cost benefit.
