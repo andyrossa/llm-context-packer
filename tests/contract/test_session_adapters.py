@@ -1,0 +1,336 @@
+from __future__ import annotations
+
+import ast
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from ithrl.adapters import (
+    AdapterError,
+    AdapterErrorCode,
+    NativeSession,
+    SourceFacts,
+    enumerate_decisions,
+    parse_session,
+    select_decision,
+)
+from ithrl.adapters._jsonl import JsonlDocument, read_jsonl
+from ithrl.adapters.contracts import ParsingLimits
+from ithrl.adapters.registry import NativeSessionParser, _parse_document, decision_input_node_id
+from ithrl.context import JsonObject
+
+FIXTURES = Path(__file__).parents[1] / "fixtures"
+CASES = (
+    (
+        FIXTURES / "codex-session" / "rollout.jsonl",
+        "codex",
+        "codex-rollout-jsonl",
+        "0.153.4",
+        None,
+        13,
+        "fixture.unknown_record",
+    ),
+    (
+        FIXTURES / "copilot-session" / "events.jsonl",
+        "copilot",
+        "copilot-events-jsonl",
+        "1.0.82",
+        1,
+        27,
+        "fixture.unknown_event",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    (
+        "fixture",
+        "harness",
+        "format_name",
+        "producer_version",
+        "record_schema_version",
+        "record_count",
+        "unknown_type",
+    ),
+    CASES,
+)
+def test_builtin_adapter_contract(
+    fixture: Path,
+    harness: str,
+    format_name: str,
+    producer_version: str,
+    record_schema_version: int | None,
+    record_count: int,
+    unknown_type: str,
+) -> None:
+    before = fixture.stat()
+    expected_bytes = fixture.read_bytes()
+
+    session = parse_session(fixture)
+
+    after = fixture.stat()
+    assert session.metadata.format.harness == harness
+    assert session.metadata.format.name == format_name
+    assert session.metadata.format.producer_version == producer_version
+    assert session.metadata.format.record_schema_version == record_schema_version
+    assert session.record_count == record_count
+    assert session.native_bytes == expected_bytes
+    assert session.source.sha256 == hashlib.sha256(expected_bytes).hexdigest()
+    assert any(record["type"] == unknown_type for record in session.records)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+def test_native_session_returns_defensive_record_copies() -> None:
+    session = parse_session(CASES[0][0])
+    records = session.records
+    records[0]["type"] = "changed"
+
+    assert session.records[0]["type"] == "session_meta"
+
+
+@pytest.mark.parametrize("empty", ["bytes", "records"])
+def test_native_session_refuses_empty_evidence(empty: str) -> None:
+    session = parse_session(CASES[0][0])
+    with pytest.raises(ValueError, match="native session evidence must not be empty"):
+        NativeSession(
+            metadata=session.metadata,
+            source=session.source,
+            native_bytes=b"" if empty == "bytes" else session.native_bytes,
+            records=() if empty == "records" else session.records,
+        )
+
+
+@pytest.mark.parametrize(("sha256", "size_delta"), [("0" * 64, 0), (None, 1)])
+def test_native_session_requires_source_facts_to_match_bytes(
+    sha256: str | None,
+    size_delta: int,
+) -> None:
+    parsed = parse_session(CASES[0][0])
+    source = SourceFacts(
+        sha256=sha256 or parsed.source.sha256,
+        size_bytes=parsed.source.size_bytes + size_delta,
+    )
+
+    with pytest.raises(ValueError, match="native session"):
+        NativeSession(
+            metadata=parsed.metadata,
+            source=source,
+            native_bytes=parsed.native_bytes,
+            records=parsed.records,
+        )
+
+
+def test_registry_refuses_unknown_and_ambiguous_formats(tmp_path: Path) -> None:
+    source = tmp_path / "unknown.jsonl"
+    source.write_text('{"type":"fixture.unknown"}\n', encoding="utf-8")
+
+    with pytest.raises(AdapterError) as unsupported:
+        parse_session(source)
+    assert unsupported.value.code is AdapterErrorCode.UNSUPPORTED_FORMAT
+    assert source.name not in str(unsupported.value)
+
+    document = read_jsonl(source, limits=ParsingLimits())
+    parsers: tuple[NativeSessionParser, ...] = (_AlwaysMatches(), _AlwaysMatches())
+    with pytest.raises(AdapterError) as ambiguous:
+        _parse_document(document, parsers)
+    assert ambiguous.value.code is AdapterErrorCode.AMBIGUOUS_FORMAT
+
+
+def test_adapter_layers_do_not_depend_on_execution_or_network_modules() -> None:
+    package = Path(__file__).parents[2] / "src" / "ithrl" / "adapters"
+    forbidden = (
+        "httpx",
+        "requests",
+        "socket",
+        "subprocess",
+        "urllib",
+        "ithrl.case",
+        "ithrl.cli",
+        "ithrl.execution",
+        "ithrl.observations",
+        "ithrl.reduce",
+        "ithrl.runner",
+        "ithrl.workflow",
+    )
+
+    for source in package.rglob("*.py"):
+        _assert_no_forbidden_imports(source, forbidden)
+
+
+def test_case_layer_does_not_depend_on_harness_or_execution_modules() -> None:
+    package = Path(__file__).parents[2] / "src" / "ithrl" / "case"
+    forbidden = (
+        "httpx",
+        "requests",
+        "socket",
+        "subprocess",
+        "urllib",
+        "ithrl.adapters",
+        "ithrl.cli",
+        "ithrl.execution",
+        "ithrl.observations",
+        "ithrl.reduce",
+        "ithrl.runner",
+        "ithrl.workflow",
+    )
+
+    for source in package.rglob("*.py"):
+        _assert_no_forbidden_imports(source, forbidden)
+
+
+def test_shared_domain_layers_do_not_depend_on_concrete_harnesses() -> None:
+    root = Path(__file__).parents[2] / "src" / "ithrl"
+    shared = (
+        root / "behavior.py",
+        root / "context.py",
+        root / "decisions.py",
+        root / "experiment.py",
+        root / "measurement.py",
+        root / "observations.py",
+        root / "workflow.py",
+        *sorted((root / "execution").glob("*.py")),
+        *sorted((root / "reduce").glob("*.py")),
+        *sorted((root / "results").glob("*.py")),
+        *sorted((root / "runner").glob("*.py")),
+    )
+
+    for source in shared:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        imported = _imported_modules(tree)
+        assert not {
+            module
+            for module in imported
+            if module.startswith(
+                (
+                    "ithrl.adapters.codex",
+                    "ithrl.adapters.copilot",
+                    "ithrl.runner.codex",
+                    "ithrl.runner.copilot",
+                )
+            )
+        }, source
+
+
+def test_runner_core_does_not_depend_on_adapters_cli_or_workflow() -> None:
+    package = Path(__file__).parents[2] / "src" / "ithrl" / "runner"
+    forbidden = ("ithrl.adapters", "ithrl.cli", "ithrl.workflow")
+
+    for source in (*package.glob("*.py"), *(package / "runtime").glob("*.py")):
+        _assert_no_forbidden_imports(source, forbidden)
+
+
+def test_concrete_runners_do_not_depend_on_ui_or_concrete_adapters() -> None:
+    package = Path(__file__).parents[2] / "src" / "ithrl" / "runner"
+
+    for harness in ("codex", "copilot"):
+        forbidden = ("ithrl.cli", "ithrl.workflow")
+        for source in (package / harness).glob("*.py"):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            imported = _imported_modules(tree)
+            assert not {
+                module
+                for module in imported
+                if any(
+                    module == blocked or module.startswith(f"{blocked}.") for blocked in forbidden
+                )
+            }, source
+            assert not {
+                module
+                for module in imported
+                if module.startswith("ithrl.adapters.")
+                and not module.startswith(("ithrl.adapters.contracts", "ithrl.adapters.registry"))
+            }, source
+
+
+def test_workflow_has_no_concrete_runner_selection_branch() -> None:
+    source = Path(__file__).parents[2] / "src" / "ithrl" / "workflow.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    imported = _imported_modules(tree)
+
+    assert "ithrl.runner.fake" not in imported
+    assert "ithrl.adapters.codex" not in imported
+    assert "ithrl.adapters.copilot" not in imported
+    assert not any(
+        isinstance(node, ast.Name) and node.id in {"FakeRunner", "FakeRunnerConfig"}
+        for node in ast.walk(tree)
+    )
+
+
+def _assert_no_forbidden_imports(source: Path, forbidden: tuple[str, ...]) -> None:
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    imported = _imported_modules(tree)
+    assert not {
+        module
+        for module in imported
+        if any(module == blocked or module.startswith(f"{blocked}.") for blocked in forbidden)
+    }, source
+
+
+def _imported_modules(tree: ast.AST) -> set[str]:
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules.add(node.module)
+    return modules
+
+
+class _AlwaysMatches:
+    format_name = "fixture"
+
+    def matches(self, document: JsonlDocument) -> bool:
+        del document
+        return True
+
+    def parse(self, document: JsonlDocument) -> NativeSession:
+        del document
+        raise AssertionError("ambiguous formats must be refused before parsing")
+
+
+@pytest.mark.parametrize(
+    ("fixture", "input_line"),
+    [(CASES[0][0], 9), (CASES[1][0], 14)],
+)
+def test_registered_decision_input_uses_existing_snapshot_without_changing_source(
+    fixture: Path, input_line: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = parse_session(fixture)
+    decision = enumerate_decisions(session)[0]
+    selected = select_decision(
+        session, decision_id=decision.decision_id, target_id=decision.targets[0].target_id
+    )
+    records = session.records
+    before = session.records
+    native_bytes = session.native_bytes
+
+    def unexpected_snapshot(_session: NativeSession) -> tuple[JsonObject, ...]:
+        raise AssertionError("decision input discovery must reuse the supplied record snapshot")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(NativeSession, "records", property(unexpected_snapshot))
+        fixed_input = decision_input_node_id(
+            session, selected.evidence.selector, selected.context, records=records
+        )
+    assert fixed_input == selected.context.nodes[input_line - 1].id
+    assert records == before
+    assert session.records == before
+    assert session.native_bytes == native_bytes
+
+
+def test_registered_decision_input_refuses_unknown_native_format() -> None:
+    session = parse_session(CASES[0][0])
+    decision = enumerate_decisions(session)[0]
+    selected = select_decision(
+        session, decision_id=decision.decision_id, target_id=decision.targets[0].target_id
+    )
+    session.metadata = session.metadata.model_copy(
+        update={"format": session.metadata.format.model_copy(update={"name": "unknown"})}
+    )
+    with pytest.raises(AdapterError) as captured:
+        decision_input_node_id(
+            session, selected.evidence.selector, selected.context, records=session.records
+        )
+    assert captured.value.code is AdapterErrorCode.UNSUPPORTED_FORMAT
+    assert str(captured.value) == "session format does not support decision input discovery"
