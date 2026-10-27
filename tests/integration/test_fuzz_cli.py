@@ -1,0 +1,1334 @@
+"""CLI walkthroughs run real collection and persistence without native/provider access."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Literal
+from unittest.mock import Mock
+
+import pytest
+from pydantic import ValidationError
+from typer.testing import CliRunner
+
+from ithrl.cli import app, fuzz_run
+from ithrl.cli.fuzz_session import (
+    FuzzProfile,
+    FuzzSession,
+    FuzzSessionError,
+    load_fuzz_profile,
+    load_fuzz_session,
+    save_fuzz_profile,
+)
+from ithrl.cli.output import ExitCode
+from ithrl.observations import ObservationStore
+from ithrl.run_state import SampledRunStateFile
+from ithrl.runner import PreparedAttempt, RunResult
+from ithrl.synthetic import extract_inference
+from native_support.smoke import protected_tree
+
+CONFIGURATION = """seed = 1
+mutators = ["append-stale-text"]
+max_candidates = 4
+max_simplification_trials = 4
+minimum_decrease = 0.1
+eligibility_policy = "independent-safe-preaccept-only"
+freshness_seconds = 86400
+stale_text = "PRIVATE-STRESS-TEXT"
+[calibration]
+required_valid = 2
+minimum_matches = 2
+max_attempts = 2
+[screening]
+minimum_decrease = 0.4
+[screening.original]
+required_valid = 2
+max_attempts = 2
+[screening.mutant]
+required_valid = 2
+max_attempts = 2
+[confirmation]
+alpha = 0.05
+[confirmation.original]
+required_valid = 20
+max_attempts = 20
+[confirmation.mutant]
+required_valid = 20
+max_attempts = 20
+[limits]
+max_provider_calls = 0
+max_wall_time_seconds = 10000
+attempt_timeout_seconds = 1
+"""
+
+
+def inputs(
+    tmp_path: Path,
+    *,
+    source_backed: bool = False,
+    harness: Literal["codex", "copilot"] = "codex",
+) -> list[str]:
+    if source_backed:
+        if harness == "copilot":
+            from native_support.copilot import _case as copilot_case
+
+            copilot_case(tmp_path, "final-response", context_sensitive=True)
+        else:
+            from native_support.codex import _case
+
+            _case(tmp_path)
+    else:
+        extract_inference(
+            Path(__file__).parents[1] / "fixtures/synthetic-trace.json",
+            inference_call_id="synthetic-ac-001",
+            case_path=tmp_path / "case",
+        )
+    config = tmp_path / "fuzz.toml"
+    config.write_text(CONFIGURATION)
+    config.chmod(0o600)
+    return [
+        "fuzz",
+        str(tmp_path / "case"),
+        "--config",
+        str(config),
+        "--observation-store",
+        str(tmp_path / "private" / "observations.sqlite"),
+        "--format",
+        "json",
+    ]
+
+
+def _protected_inputs(root: Path):
+    case = protected_tree(root / "case", allow_case_results=True)
+    # Canonical run state and result receipts are the command's owned outputs.
+    case = {path: value for path, value in case.items() if path.parts[:1] != (".runs",)}
+    return case, protected_tree(root / "original")
+
+
+def test_fake_dry_run_has_no_execution_or_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = inputs(tmp_path)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("dry-run attempted execution or native detection")
+
+    monkeypatch.setattr("ithrl.cli.native.native_selection", forbidden)
+    monkeypatch.setattr("ithrl.runner.FakeRunner.run", forbidden)
+    result = CliRunner().invoke(app, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["status"] == "ready"
+    assert report["harness_started"] is False
+    assert report["planned_provider_calls"] == 0
+    assert report["stress_text_bytes"] == len("PRIVATE-STRESS-TEXT")
+    assert "PRIVATE-STRESS-TEXT" not in result.output
+    assert not (tmp_path / "private").exists()
+    assert not (tmp_path / "case/.runs").exists()
+
+    refused = CliRunner().invoke(app, [*args, "--dry-run", "--max-provider-calls-per-attempt", "1"])
+    assert refused.exit_code == ExitCode.UNSUPPORTED, refused.output
+    assert json.loads(refused.stdout)["error_code"] == "provider-call-limit-native-only"
+    assert not (tmp_path / "private").exists()
+    assert not (tmp_path / "case/.runs").exists()
+
+
+def test_fake_campaign_saved_rates_and_terminal_resume(tmp_path: Path) -> None:
+    args = inputs(tmp_path)
+    config = tmp_path / "fuzz.toml"
+    config.write_text(
+        config.read_text().replace(
+            "PRIVATE-STRESS-TEXT", "PRIVATE-STRESS-TEXT\\n\\nPRIVATE-SECOND-PARAGRAPH"
+        )
+    )
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["status"] == "confirmed-change", report
+    assert report["confirmation_original"]["matches"] == 20
+    assert report["confirmation_mutant"]["matches"] == 0
+    assert report["difference"] == 1.0
+    assert report["lower_bound"] > 0.1
+    assert report["provider_calls"] == 0
+    assert report["usage"]["charged_provider_calls"] == 0
+    assert report["actions_executed"] == 0
+    assert "PRIVATE-STRESS-TEXT" not in result.output
+    assert "PRIVATE-SECOND-PARAGRAPH" not in result.output
+    assert "Calibration: original 0/2 valid (0 attempts)" in result.stderr
+    assert "Calibration: original 1/2 valid (1 attempts)" in result.stderr
+    assert "Calibration: original 2/2 valid (2 attempts)" in result.stderr
+    assert "Exploratory trial 1: original 0/2 valid (0 attempts)" in result.stderr
+    assert "Simplification trial 2:" in result.stderr
+    assert "Confirmation: original 0/20 valid (0 attempts)" in result.stderr
+    assert (
+        "Confirmation: original 20/20 valid (20 attempts); mutant 20/20 valid (20 attempts)"
+        in result.stderr
+    )
+    receipt = Path(report["result_path"])
+    saved = json.loads((receipt / "summary.json").read_text())
+    assert saved["confirmation_original"]["match_rate"] == 1.0
+    assert saved["confirmation_mutant"]["match_rate"] == 0.0
+    session = load_fuzz_session(receipt)
+    store = ObservationStore(session.observation_store)
+    state = SampledRunStateFile.open(session.run_directory)
+    with state.acquire_lock(store):
+        before = state.snapshot(store, now=datetime.now(UTC))
+    resumed = CliRunner().invoke(app, ["fuzz", str(receipt), "--resume", "--format", "json"])
+    assert resumed.exit_code == 0, resumed.output
+    assert json.loads(resumed.stdout)["status"] == "confirmed-change"
+    assert "Calibration:" not in resumed.stderr
+    assert "Exploratory trial" not in resumed.stderr
+    assert "Confirmation:" not in resumed.stderr
+    with state.acquire_lock(store):
+        assert state.snapshot(store, now=datetime.now(UTC)).state == before.state
+
+
+def mock_native(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_backed: bool = False,
+    fresh: bool = False,
+    harness: Literal["codex", "copilot"] = "codex",
+):
+    from fuzz_support import FuzzRunner
+    from ithrl.behavior import FinalResponseTarget
+    from ithrl.cli.native import NativeSelection
+    from ithrl.execution import ResourceLimits, SafetyPolicy
+    from ithrl.experiment import (
+        NativeRunnerConfig,
+        SampledExperimentDefinition,
+        StructuralOracleConfig,
+    )
+    from ithrl.fuzz.configuration import FuzzConfiguration
+    from ithrl.runner import RunnerRegistry
+
+    args = inputs(tmp_path, source_backed=source_backed, harness=harness)
+    runner = FuzzRunner()
+    if source_backed:
+        from ithrl.runner import RunAccounting
+        from ithrl.runner.codex.materialize import materialize_codex_attempt
+        from ithrl.runner.copilot.materialize import materialize_copilot_attempt
+        from ithrl.runner.copilot.policy import (
+            RECONSTRUCTION_METHOD as COPILOT_RECONSTRUCTION_METHOD,
+        )
+
+        materialize = (
+            materialize_codex_attempt if harness == "codex" else materialize_copilot_attempt
+        )
+
+        runner.capability_profile = runner.capability_profile.model_copy(
+            update={
+                "runner_type": harness,
+                "harness": harness,
+                "source_schema": (
+                    "codex-rollout-jsonl" if harness == "codex" else "copilot-events-jsonl"
+                ),
+                "supported_capture_types": ("logical-session",),
+                "supported_materializations": ("source-backed",),
+                "reconstruction_method": (
+                    "codex-app-server-inject-checkpoint-v1"
+                    if harness == "codex"
+                    else COPILOT_RECONSTRUCTION_METHOD
+                ),
+            }
+        )
+
+        async def native_run(attempt: PreparedAttempt) -> RunResult:
+            materialize(attempt)
+            runner.calls.append(attempt)
+            return RunResult(
+                attempt_id=attempt.attempt_id,
+                effective_policy_digest=attempt.safety_policy.digest,
+                final_text="Fixture complete." if attempt.candidate.mutation.is_empty else "RED",
+                provider=runner.capability_profile.provider,
+                endpoint=runner.capability_profile.endpoint,
+                model_requested=attempt.execution_plan.model_requested,
+                model_returned=attempt.execution_plan.model_requested,
+                accounting=RunAccounting(
+                    provider_calls_started=1, provider_calls_completed=1, elapsed_milliseconds=1
+                ),
+            )
+
+        monkeypatch.setattr(runner, "run", native_run)
+    config_path = tmp_path / "fuzz.toml"
+    config_path.write_text(
+        CONFIGURATION.replace("max_provider_calls = 0", "max_provider_calls = 500")
+    )
+    config = FuzzConfiguration.from_toml(config_path.read_text())
+    experiment = SampledExperimentDefinition(
+        schema_version=1,
+        target=FinalResponseTarget(text_equals="Fixture complete." if source_backed else "BLUE"),
+        oracle=StructuralOracleConfig(),
+        runner=NativeRunnerConfig(
+            type=harness, required_capability_digest=runner.capability_profile.digest
+        ),
+        calibration=config.calibration,
+    )
+    if not fresh:
+        (tmp_path / "case/experiments/default.toml").write_text(experiment.to_toml())
+    selection = NativeSelection(
+        registry=RunnerRegistry({harness: lambda _c, _e: runner}),
+        safety_policy=SafetyPolicy(
+            provider_transport="allowed",
+            allowed_provider="synthetic-provider",
+            allowed_endpoint="https://provider.example.invalid",
+        ),
+        resource_limits=ResourceLimits(max_provider_calls=1, max_wall_time_seconds=1),
+        experiment=experiment,
+    )
+    detections = []
+
+    def detect(*_args: object, **_kwargs: object):
+        from dataclasses import replace
+
+        detections.append(True)
+        requested_limit = _kwargs.get("max_provider_calls_per_attempt")
+        assert (
+            requested_limit is None
+            or requested_limit == runner.capability_profile.provider_calls_per_attempt
+        )
+        requested = _kwargs.get("experiment")
+        if fresh:
+            assert requested is None
+            assert _kwargs["calibration"] == config.calibration
+            return selection
+        assert isinstance(requested, SampledExperimentDefinition)
+        assert isinstance(requested.runner, NativeRunnerConfig)
+        assert requested.runner.required_capability_digest == runner.capability_profile.digest
+        return replace(
+            selection,
+            experiment=requested.model_copy(
+                update={
+                    "runner": NativeRunnerConfig(
+                        type=harness, required_capability_digest=runner.capability_profile.digest
+                    )
+                }
+            ),
+        )
+
+    monkeypatch.setattr("ithrl.cli.native.native_selection", detect)
+    original = tmp_path / "original"
+    original.mkdir(mode=0o700)
+    (original / "protected.txt").write_text("unchanged\n")
+    return [*args, "--original-workspace", str(original)], runner, detections
+
+
+@pytest.mark.parametrize(
+    ("source_backed", "fresh", "harness"),
+    [
+        (False, False, "codex"),
+        (True, False, "codex"),
+        (True, True, "codex"),
+        (True, False, "copilot"),
+        (True, True, "copilot"),
+    ],
+)
+def test_native_detection_consent_and_saved_profile_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_backed: bool,
+    fresh: bool,
+    harness: Literal["codex", "copilot"],
+) -> None:
+    args, runner, detections = mock_native(
+        tmp_path, monkeypatch, source_backed=source_backed, fresh=fresh, harness=harness
+    )
+    experiment_before = (tmp_path / "case/experiments/default.toml").read_bytes()
+    protected = _protected_inputs(tmp_path)
+    refused = CliRunner().invoke(app, args)
+    assert refused.exit_code == ExitCode.UNSUPPORTED, refused.output
+    assert json.loads(refused.stdout)["error_code"] == "detection-required"
+    preflight = CliRunner().invoke(
+        app, [*args, "--dry-run", "--max-provider-calls-per-attempt", "1"]
+    )
+    assert preflight.exit_code == 0, preflight.output
+    assert json.loads(preflight.stdout)["status"] == "detection-required"
+    assert json.loads(preflight.stdout)["harness"] == harness
+    assert "--max-provider-calls-per-attempt 1" in json.loads(preflight.stdout)["next_command"]
+    assert not detections
+    assert not runner.calls
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == 0, detected.output
+    assert len(detections) == 1
+    assert not runner.calls
+    report = json.loads(detected.stdout)
+    assert report["provider"] == "synthetic-provider"
+    expected_sites = (2 if harness == "copilot" else 1) if source_backed else 6
+    assert report["editable_text_sites"] == expected_sites
+    assert profile.stat().st_mode & 0o777 == 0o600
+    args += ["--profile", str(profile)]
+    dry = CliRunner().invoke(app, [*args, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert json.loads(dry.stdout)["capability_source"] == "saved-detection"
+    assert len(detections) == 1
+    assert not runner.calls
+    refused = CliRunner().invoke(app, args)
+    assert json.loads(refused.stdout)["error_code"] == "model-execution-not-acknowledged"
+    assert len(detections) == 1
+    assert not runner.calls
+    result = CliRunner().invoke(app, [*args, "--acknowledge-model-execution"])
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.stdout)
+    assert output["status"] == "confirmed-change", output
+    assert output["usage"]["charged_provider_calls"] == len(runner.calls)
+    assert output["provider_calls"] == len(runner.calls)
+    assert len(detections) == 2
+    assert "PRIVATE-STRESS-TEXT" not in result.output
+    before = len(runner.calls)
+    saved = CliRunner().invoke(
+        app, ["fuzz", output["result_path"], "--resume", "--dry-run", "--format", "json"]
+    )
+    assert saved.exit_code == 0, saved.output
+    assert json.loads(saved.stdout)["capability_source"] == "saved-detection"
+    assert json.loads(saved.stdout)["harness_started"] is False
+    assert len(detections) == 2
+    assert len(runner.calls) == before
+    if source_backed:
+        assert any(not call.candidate.mutation.is_empty for call in runner.calls)
+        assert all(not call.evidence.has_request for call in runner.calls)
+        resumed = CliRunner().invoke(
+            app,
+            [
+                "fuzz",
+                output["result_path"],
+                "--resume",
+                "--acknowledge-model-execution",
+                "--format",
+                "json",
+            ],
+        )
+        assert resumed.exit_code == 0, resumed.output
+        assert json.loads(resumed.stdout)["status"] == "confirmed-change"
+        assert len(detections) == 3
+        assert len(runner.calls) == before
+    assert protected == _protected_inputs(tmp_path)
+    assert (tmp_path / "case/experiments/default.toml").read_bytes() == experiment_before
+
+
+@pytest.mark.parametrize(
+    ("outcome", "failure_phase"),
+    [
+        ("inconclusive", None),
+        ("incomplete", "discovery"),
+        ("incomplete", "confirmation"),
+        ("no-candidate-found", None),
+    ],
+)
+def test_mock_native_terminal_outcomes_are_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, failure_phase: str | None
+) -> None:
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    if outcome == "no-candidate-found":
+        runner.mutant_matches = True
+    elif outcome == "inconclusive":
+        # Exploration still sees an effect. Only the fresh holdout loses it.
+        original_run = runner.run
+
+        async def changed(attempt: PreparedAttempt) -> RunResult:
+            if attempt.phase == "confirmation":
+                runner.mutant_matches = True
+            return await original_run(attempt)
+
+        monkeypatch.setattr(runner, "run", changed)
+    else:
+        original_run = runner.run
+
+        async def failed(attempt: PreparedAttempt) -> RunResult:
+            if attempt.phase == failure_phase:
+                runner.fail = True
+            return await original_run(attempt)
+
+        monkeypatch.setattr(runner, "run", failed)
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == 0, detected.output
+    result = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    output = json.loads(result.stdout)
+    assert output["status"] == outcome, output
+    if outcome == "incomplete":
+        assert output["execution_reliability"]["runner_errors"] == 1
+        assert output["confirmation_original"]["no_matches"] == 0
+        assert output["confirmation_mutant"]["no_matches"] == 0
+        if failure_phase == "discovery":
+            assert output["selected_mutation_digest"] is None
+            assert output["confirmation_result"] == "not-run"
+            assert output["confirmation_original"]["dispatched"] == 0
+            assert output["confirmation_mutant"]["dispatched"] == 0
+        else:
+            assert output["selected_mutation_digest"] is not None
+            assert output["confirmation_result"] == "incomplete"
+            assert (
+                output["confirmation_original"]["runner_errors"]
+                + output["confirmation_mutant"]["runner_errors"]
+                == 1
+            )
+    before = len(runner.calls)
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            output["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    assert json.loads(resumed.stdout)["status"] == outcome, resumed.output
+    assert len(runner.calls) == before
+
+
+@pytest.mark.parametrize("boundary", ["calibration", "trial", "confirmation", "progress"])
+def test_interruption_resumes_exact_campaign_without_repeating_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    import ithrl.cli.fuzz_run as fuzz_run
+    from ithrl.observations import SamplingBlockEvidence
+    from ithrl.run_state import SampledRunState
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    protected = _protected_inputs(tmp_path)
+    profile = tmp_path / "profile.json"
+    assert CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)]).exit_code == 0
+    write = SampledRunStateFile._write
+    interrupted = False
+
+    def interrupt(self: SampledRunStateFile, state: SampledRunState) -> None:
+        nonlocal interrupted
+        write(self, state)
+        block = state.blocks[-1] if state.blocks else None
+        hit = (
+            (boundary == "calibration" and len(state.calibration_observation_ids) == 1)
+            or (
+                boundary == "trial"
+                and state.fuzz_progress is not None
+                and bool(state.fuzz_progress.trials)
+            )
+            or (
+                boundary == "confirmation"
+                and block is not None
+                and block.plan.role == "confirmation"
+                and len(block.observations) == 2
+                and state.pending is None
+            )
+        )
+        if hit and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(SampledRunStateFile, "_write", interrupt)
+    status = fuzz_run._sampling_status
+
+    def interrupt_progress(trial: int, block: SamplingBlockEvidence) -> str:
+        nonlocal interrupted
+        if boundary == "progress" and len(block.attempts) == 2 and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt()
+        return status(trial, block)
+
+    monkeypatch.setattr(fuzz_run, "_sampling_status", interrupt_progress)
+    first = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    report = json.loads(first.stdout)
+    assert interrupted
+    assert report["status"] == "interrupted", report
+    ids = [a.attempt_id for a in runner.calls]
+    assert report["usage"]["charged_provider_calls"] == len(ids)
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    final = json.loads(resumed.stdout)
+    assert final["status"] == "confirmed-change", final
+    assert final["usage"]["charged_provider_calls"] == len(runner.calls)
+    assert len({a.attempt_id for a in runner.calls}) == len(runner.calls)
+    assert [a.attempt_id for a in runner.calls[: len(ids)]] == ids
+    assert protected == _protected_inputs(tmp_path)
+
+
+def test_unresolved_calibration_dispatch_stays_charged_without_reexecution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ithrl.calibration as calibration
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    profile = tmp_path / "profile.json"
+    assert CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)]).exit_code == 0
+    reserve = calibration._reserve_attempt
+
+    def interrupt(store: ObservationStore, reservation: calibration._InFlightAttempt) -> None:
+        reserve(store, reservation)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(calibration, "_reserve_attempt", interrupt)
+    first = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    report = json.loads(first.stdout)
+    assert report["status"] == "interrupted", report
+    assert report["usage"]["actual_provider_calls"] == 0
+    assert report["usage"]["pending_provider_calls"] == 1
+    assert report["usage"]["charged_provider_calls"] == 1
+    assert report["actions_executed"] is None
+    assert report["provider_calls"] is None
+    assert report["next_command"] is None
+    assert not runner.calls
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    output = json.loads(resumed.stdout)
+    assert output["stop_reason"] == "unresolved-calibration-dispatch", output
+    assert output["usage"]["charged_provider_calls"] == 1
+    assert not runner.calls
+
+
+def test_profile_change_and_unsupported_mutation_refuse_before_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ithrl.experiment import NativeRunnerConfig, SampledExperimentDefinition
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    profile = tmp_path / "profile.json"
+    assert CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)]).exit_code == 0
+    runner.capability_profile = runner.capability_profile.model_copy(
+        update={"supported_context_operations": ("dependency-closed-removal",)}
+    )
+    changed = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    assert changed.exit_code != 0
+    assert not runner.calls
+    experiment_path = tmp_path / "case/experiments/default.toml"
+    experiment = SampledExperimentDefinition.from_toml(experiment_path.read_text())
+    experiment_path.write_text(
+        experiment.model_copy(
+            update={
+                "runner": NativeRunnerConfig(
+                    type="codex", required_capability_digest=runner.capability_profile.digest
+                )
+            }
+        ).to_toml()
+    )
+    current = tmp_path / "current.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(current)])
+    assert detected.exit_code == 0, detected.output
+    refused = CliRunner().invoke(app, [*args, "--profile", str(current), "--dry-run"])
+    assert json.loads(refused.stdout)["error_code"] == "unsupported-context-operation", (
+        refused.output
+    )
+    assert not runner.calls
+
+
+def test_insufficient_budget_is_visible_before_storage_or_execution(tmp_path: Path) -> None:
+    args = inputs(tmp_path)
+    config_path = tmp_path / "fuzz.toml"
+    config_path.write_text(
+        CONFIGURATION.replace("max_wall_time_seconds = 10000", "max_wall_time_seconds = 1")
+    )
+    result = CliRunner().invoke(app, [*args, "--dry-run"])
+    report = json.loads(result.stdout)
+    assert result.exit_code == 6, report
+    assert report["stop_reason"] == "wall-time-budget"
+    assert report["minimum_wall_time_seconds"] > 1
+    assert not (tmp_path / "private").exists()
+
+
+@pytest.mark.parametrize("policy", ["safe-provider-overload", "independent-safe-preaccept-only"])
+def test_calibration_uses_frozen_policy_for_a_verified_overload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+) -> None:
+    from ithrl.runner import (
+        NativeOutputReference,
+        ProviderAcceptanceState,
+        RunAccounting,
+        RunnerError,
+        RunnerErrorCode,
+    )
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    config_path = tmp_path / "fuzz.toml"
+    config_path.write_text(
+        config_path.read_text()
+        .replace(
+            'eligibility_policy = "independent-safe-preaccept-only"',
+            f'eligibility_policy = "{policy}"',
+        )
+        .replace("max_attempts = 2", "max_attempts = 3", 1)
+    )
+    original_run = runner.run
+    failed = False
+
+    async def overload_once(attempt: PreparedAttempt) -> RunResult:
+        nonlocal failed
+        if not failed:
+            failed = True
+            runner.calls.append(attempt)
+            raise RunnerError(
+                RunnerErrorCode.PROVIDER_OVERLOADED,
+                "Synthetic overload.",
+                provider_acceptance_state=ProviderAcceptanceState.UNKNOWN,
+                effective_policy_digest=attempt.safety_policy.digest,
+                model_requested=attempt.execution_plan.model_requested,
+                provider="synthetic-provider",
+                endpoint="https://provider.example.invalid",
+                behavior_output_observed=False,
+                native_output=NativeOutputReference(
+                    artifact_id="fixture-overload",
+                    sha256="a" * 64,
+                    media_type="application/json",
+                    size_bytes=100,
+                ),
+                accounting=RunAccounting(
+                    provider_calls_started=1,
+                    native_output_bytes=100,
+                    process_outcome="exited",
+                    cleanup_outcome="verified",
+                ),
+            )
+        return await original_run(attempt)
+
+    monkeypatch.setattr(runner, "run", overload_once)
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == 0, detected.output
+    result = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    report = json.loads(result.stdout)
+    if policy == "safe-provider-overload":
+        assert report["status"] == "confirmed-change", report
+        assert report["calibration"]["valid"] == 2
+        assert report["calibration"]["runner_errors"] == 1
+    else:
+        assert report["status"] == "incomplete", report
+        assert report["stop_reason"] == "unsafe-retry"
+        assert report["calibration"]["valid"] == 0
+        assert len(runner.calls) == 1
+    assert report["unknown_acceptance_attempts"] == 1
+    assert report["usage"]["charged_provider_calls"] == len(runner.calls)
+    assert report["execution_reliability"]["runner_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    ("matches", "reason"),
+    [(0, "calibration-not-measurable"), (1, "calibration-inconclusive")],
+)
+def test_completed_unmeasurable_calibration_reports_inconclusive_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, matches: int, reason: str
+) -> None:
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    runner.original_matching = matches
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == ExitCode.SUCCESS, detected.output
+    result = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    report = json.loads(result.stdout)
+    assert result.exit_code == ExitCode.INCONCLUSIVE, report
+    assert report["status"] == "inconclusive"
+    assert report["stop_reason"] == reason
+    assert report["calibration"]["matches"] == matches
+    assert report["calibration"]["valid"] == 2
+    assert report["calibration"]["runner_errors"] == 0
+    assert report["confirmation_result"] == "not-run"
+    assert report["next_command"] is None
+    assert len(runner.calls) == 2
+    assert all(attempt.phase == "calibration" for attempt in runner.calls)
+    saved = json.loads((Path(report["result_path"]) / "summary.json").read_text())
+    assert saved["status"] == "inconclusive"
+    assert saved["stop_reason"] == reason
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    assert resumed.exit_code == ExitCode.INCONCLUSIVE, resumed.output
+    assert json.loads(resumed.stdout)["stop_reason"] == reason
+    assert json.loads(resumed.stdout)["next_command"] is None
+    assert len(runner.calls) == 2
+
+
+def _detected_mock_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == 0, detected.output
+    return [*args, "--profile", str(profile), "--acknowledge-model-execution"], runner
+
+
+def test_profile_report_refuses_an_unbound_campaign_algorithm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runner = _detected_mock_command(tmp_path, monkeypatch)
+    profile = load_fuzz_profile(tmp_path / "profile.json")
+    data = profile.model_dump()
+    data["identity"]["algorithm_digest"] = "f" * 64
+    changed = FuzzProfile.model_validate(data)
+    with pytest.raises(ValueError, match="bound campaign policy"):
+        fuzz_run.report_for_profile(changed, harness_started=False)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("failure", ["calibration-refusal", "campaign-error"])
+def test_execution_refusals_retain_safe_reports_without_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    args = inputs(tmp_path)
+    if failure == "calibration-refusal":
+        monkeypatch.setattr(
+            fuzz_run, "run_owned_calibration", Mock(return_value="provider-call-budget")
+        )
+        expected = "provider-call-budget"
+    else:
+        monkeypatch.setattr(
+            fuzz_run,
+            "_initialize_fuzz_campaign_owned",
+            Mock(side_effect=OSError("private-execution-detail")),
+        )
+        expected = "execution-refused"
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == (
+        ExitCode.BUDGET if failure == "calibration-refusal" else ExitCode.PROVIDER
+    ), result.output
+    report = json.loads(result.stdout)
+    assert report["status"] == "incomplete"
+    assert report["stop_reason"] == expected
+    assert report["confirmation_result"] == "not-run"
+    assert report["actions_executed"] == 0
+    assert "private-execution-detail" not in result.output
+
+
+@pytest.mark.parametrize("operation", ["report", "resume", "missing-preparation"])
+def test_report_and_resume_recheck_frozen_administration_before_dispatch(
+    tmp_path: Path, operation: str
+) -> None:
+    result = CliRunner().invoke(app, inputs(tmp_path))
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    session = load_fuzz_session(Path(json.loads(result.stdout)["result_path"]))
+    store = ObservationStore(session.observation_store)
+    state_file = SampledRunStateFile.open(session.run_directory)
+    before = store.list_for_experiment(session.profile.experiment.digest)
+    if operation != "missing-preparation":
+        saved = json.loads(state_file.path.read_text())
+        saved["approvals"][0]["allowance"]["max_provider_calls"] += 1
+        state_file.path.write_text(json.dumps(saved))
+        message = "budget differs from its frozen session"
+    else:
+        message = "execution must match the frozen campaign identity"
+    if operation == "report":
+        with state_file.acquire_lock(store), pytest.raises(ValueError, match=message):
+            fuzz_run._report(session, state_file, store, stop_reason=None, dry_run=True)
+    else:
+        with pytest.raises(ValueError, match=message):
+            fuzz_run.execute_fuzz(session, None, dry_run=operation == "resume")
+    assert store.list_for_experiment(session.profile.experiment.digest) == before
+
+
+@pytest.mark.parametrize("changed", ["configuration", "call-cap"])
+def test_saved_fuzz_profile_refuses_changed_operator_inputs_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    arguments, runner = _detected_mock_command(tmp_path, monkeypatch)
+    expected = "profile-provider-call-limit-mismatch"
+    if changed == "configuration":
+        config = tmp_path / "fuzz.toml"
+        config.write_text(config.read_text().replace("seed = 1", "seed = 2"))
+        expected = "profile-input-mismatch"
+    else:
+        arguments += ["--max-provider-calls-per-attempt", "2"]
+    result = CliRunner().invoke(app, arguments)
+    assert result.exit_code == ExitCode.UNSUPPORTED, result.output
+    assert json.loads(result.stdout)["error_code"] == expected
+    assert runner.calls == []
+
+
+def test_detection_uses_private_default_profile_location_without_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments, runner, _ = mock_native(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    result = CliRunner().invoke(app, [*arguments, "--detect"])
+    assert result.exit_code == ExitCode.SUCCESS, result.output
+    path = Path(json.loads(result.stdout)["profile_path"])
+    assert path.parent == tmp_path / "data/ithrl/fuzz-profiles"
+    assert load_fuzz_profile(path).digest == path.stem
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "fault", ["relative-case", "identity", "foreign-run", "relative-store", "naive-start"]
+)
+def test_saved_fuzz_contracts_require_bound_identity_and_canonical_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    _, runner = _detected_mock_command(tmp_path, monkeypatch)
+    profile = load_fuzz_profile(tmp_path / "profile.json")
+    if fault in {"relative-case", "identity"}:
+        data = profile.model_dump()
+        if fault == "relative-case":
+            data["case_path"] = Path("relative")
+        else:
+            data["identity"]["runner_fingerprint"] = "changed-runner"
+        with pytest.raises(
+            ValidationError, match=r"paths must be absolute|execution identities differ"
+        ):
+            FuzzProfile.model_validate(data)
+    else:
+        run_id = "fuzz-" + "a" * 32
+        data = {
+            "run_id": run_id,
+            "run_directory": profile.case_path / ".runs" / run_id,
+            "observation_store": tmp_path / "observations.sqlite",
+            "profile": profile,
+            "started_at": datetime.now(UTC),
+        }
+        if fault == "foreign-run":
+            data["run_directory"] = tmp_path / "other-run"
+        elif fault == "relative-store":
+            data["observation_store"] = Path("relative.sqlite")
+        else:
+            data["started_at"] = datetime(2026, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+        with pytest.raises(
+            ValidationError, match=r"canonical case|absolute without traversal|UTC offset"
+        ):
+            FuzzSession.model_validate(data)
+    assert runner.calls == []
+
+
+def test_saved_fuzz_profile_is_idempotent_and_cannot_be_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runner = _detected_mock_command(tmp_path, monkeypatch)
+    path = tmp_path / "profile.json"
+    profile = load_fuzz_profile(path)
+    original = path.read_bytes()
+
+    save_fuzz_profile(path, profile)
+    assert path.read_bytes() == original
+    changed = profile.model_copy(
+        update={"configuration": profile.configuration.model_copy(update={"stale_text": "changed"})}
+    )
+    changed = type(profile).model_validate_json(changed.model_dump_json())
+    with pytest.raises(FuzzSessionError, match="different inputs"):
+        save_fuzz_profile(path, changed)
+
+    assert path.read_bytes() == original
+    assert load_fuzz_profile(path) == profile
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("tamper", ["session-identity", "unexpected-file"])
+def test_detached_fuzz_receipt_refuses_semantic_tampering_without_touching_live_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    args, runner = _detected_mock_command(tmp_path, monkeypatch)
+    completed = CliRunner().invoke(app, args)
+    assert completed.exit_code == 0, completed.output
+    report = json.loads(completed.stdout)
+    receipt = Path(report["result_path"])
+    live = Path(report["run_state_path"])
+    before = {
+        name: (live / name).read_bytes() for name in ("fuzz-session.json", "sampled-state.json")
+    }
+    calls = len(runner.calls)
+    load_fuzz_session(receipt)
+    if tamper == "session-identity":
+        path = receipt / "fuzz-session.json"
+        document = json.loads(path.read_text())
+        document["started_at"] = (
+            datetime.fromisoformat(document["started_at"]) + timedelta(seconds=1)
+        ).isoformat()
+        path.write_text(json.dumps(document))
+    else:
+        (receipt / "unexpected.json").write_text("PRIVATE-CONTENT")
+
+    with pytest.raises(FuzzSessionError, match="cannot load private fuzz session") as refused:
+        load_fuzz_session(receipt)
+
+    assert "PRIVATE-CONTENT" not in str(refused.value)
+    assert {name: (live / name).read_bytes() for name in before} == before
+    assert len(runner.calls) == calls
+
+
+@pytest.mark.parametrize("target", ["session", "state", "snapshot", "summary"])
+def test_tampered_fuzz_resume_refuses_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    args, runner = _detected_mock_command(tmp_path, monkeypatch)
+    completed = CliRunner().invoke(app, args)
+    assert completed.exit_code == 0, completed.output
+    report = json.loads(completed.stdout)
+    receipt = Path(report["result_path"])
+    live = Path(report["run_state_path"])
+    paths = {
+        "session": live / "fuzz-session.json",
+        "state": live / "sampled-state.json",
+        "snapshot": receipt / "sampling/sampling-state.json",
+        "summary": receipt / "summary.json",
+    }
+    path = paths[target]
+    assert path.is_file()
+    original = path.read_bytes()
+    path.write_text('{"PRIVATE-CORRUPTION":')
+    before = len(runner.calls)
+    refused = CliRunner().invoke(
+        app, ["fuzz", str(receipt), "--resume", "--acknowledge-model-execution", "--format", "json"]
+    )
+    assert refused.exit_code == ExitCode.UNSUPPORTED
+    assert json.loads(refused.stdout)["error_code"] == "invalid-saved-fuzz-metadata"
+    assert "PRIVATE-CORRUPTION" not in refused.output
+    assert len(runner.calls) == before
+    path.write_bytes(original)
+    conflict = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            str(receipt),
+            "--resume",
+            "--config",
+            str(tmp_path / "fuzz.toml"),
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    assert conflict.exit_code == ExitCode.UNSUPPORTED
+    assert json.loads(conflict.stdout)["error_code"] == "resume-input-conflict"
+    assert len(runner.calls) == before
+
+
+def test_budget_exhaustion_protects_confirmation_and_is_terminal_through_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    config = tmp_path / "fuzz.toml"
+    config.write_text(
+        config.read_text()
+        .replace("max_provider_calls = 500", "max_provider_calls = 46")
+        .replace(
+            'stale_text = "PRIVATE-STRESS-TEXT"',
+            'stale_text = "PRIVATE-STRESS-TEXT\\n\\nsecond paragraph"',
+        )
+    )
+    profile = tmp_path / "profile.json"
+    assert CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)]).exit_code == 0
+    result = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    report = json.loads(result.stdout)
+    assert result.exit_code == 6, report
+    assert report["status"] == "incomplete"
+    assert report["stop_reason"] == "provider-call-budget"
+    assert len(runner.calls) == 6
+    assert report["usage"]["charged_provider_calls"] == 6
+    assert report["confirmation_result"] == "not-run"
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    resumed_report = json.loads(resumed.stdout)
+    assert resumed.exit_code == ExitCode.BUDGET, resumed.output
+    assert resumed_report["status"] == "incomplete"
+    assert resumed_report["stop_reason"] == "provider-call-budget"
+    assert resumed_report["confirmation_result"] == "not-run"
+    assert len(runner.calls) == 6
+
+
+def test_interrupted_campaign_refuses_busy_resume_and_expired_block_without_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from ithrl.run_state import SampledRunState
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+    config = tmp_path / "fuzz.toml"
+    config.write_text(
+        config.read_text().replace("freshness_seconds = 86400", "freshness_seconds = 600")
+    )
+    profile = tmp_path / "profile.json"
+    assert CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)]).exit_code == 0
+    args = [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    write = SampledRunStateFile._write
+    interrupted = False
+
+    def interrupt(self: SampledRunStateFile, state: SampledRunState) -> None:
+        nonlocal interrupted
+        write(self, state)
+        if (
+            state.blocks
+            and state.blocks[-1].observations
+            and state.pending is None
+            and not interrupted
+        ):
+            interrupted = True
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(SampledRunStateFile, "_write", interrupt)
+    first = CliRunner().invoke(app, args)
+    report = json.loads(first.stdout)
+    assert report["status"] == "interrupted", report
+    assert interrupted
+    before = len(runner.calls)
+    session = load_fuzz_session(Path(report["result_path"]))
+    state_file = SampledRunStateFile.open(session.run_directory)
+    store = ObservationStore(session.observation_store)
+    resume = [
+        "fuzz",
+        report["result_path"],
+        "--resume",
+        "--acknowledge-model-execution",
+        "--format",
+        "json",
+    ]
+    with state_file.acquire_lock(store):
+        busy = CliRunner().invoke(app, resume)
+    assert busy.exit_code == ExitCode.UNSUPPORTED
+    assert len(runner.calls) == before
+
+    # Resume the recorded block after its frozen freshness allowance, without sleeping.
+    future = datetime.now(UTC) + timedelta(seconds=1200)
+
+    def now(_tz: object = None) -> datetime:
+        return future
+
+    monkeypatch.setattr("ithrl.fuzz.campaign.datetime", SimpleNamespace(now=now))
+    monkeypatch.setattr("ithrl.cli.fuzz_run.datetime", SimpleNamespace(now=now))
+    monkeypatch.setattr("ithrl.calibration.datetime", SimpleNamespace(now=now))
+    expired = CliRunner().invoke(app, resume)
+    output = json.loads(expired.stdout)
+    assert expired.exit_code == ExitCode.PROVIDER, expired.output
+    assert output["status"] == "incomplete", output
+    assert output["stop_reason"] == "freshness-expired"
+    assert output["usage"]["charged_provider_calls"] == before
+    assert output["confirmation_result"] == "not-run"
+    assert len(runner.calls) == before
+
+
+@pytest.mark.parametrize("failure", [OSError, FuzzSessionError])
+def test_failed_result_publication_retains_accounting_and_resumes_without_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
+) -> None:
+    from pydantic import BaseModel
+
+    from ithrl.cli.fuzz_session import _save_private
+
+    args, runner = _detected_mock_command(tmp_path, monkeypatch)
+
+    def fail(path: Path, model: BaseModel) -> None:
+        if path.name == "summary.json":
+            raise failure("PRIVATE-PUBLICATION-FAILURE")
+        _save_private(path, model)
+
+    monkeypatch.setattr("ithrl.cli.fuzz_session._save_private", fail)
+    result = CliRunner().invoke(app, args)
+    report = json.loads(result.stdout)
+    assert result.exit_code == ExitCode.INTERNAL
+    assert report["status"] == "incomplete", report
+    assert report["error_code"] == "result-publication-failed"
+    assert report["usage"]["charged_provider_calls"] == len(runner.calls)
+    assert report["provider_calls"] == len(runner.calls)
+    assert report["confirmation_result"] == "confirmed-change"
+    assert report["result_path"] is None
+    assert report["run_state_path"] is not None
+    assert "PRIVATE-PUBLICATION-FAILURE" not in result.output
+    before = len(runner.calls)
+    assert not tuple((tmp_path / "case/results").glob(".fuzz-*"))
+    monkeypatch.setattr("ithrl.cli.fuzz_session._save_private", _save_private)
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["run_state_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    final = json.loads(resumed.stdout)
+    assert resumed.exit_code == 0, final
+    assert final["status"] == "confirmed-change"
+    assert Path(final["result_path"]).is_dir()
+    assert len(runner.calls) == before
+
+
+@pytest.mark.parametrize("publication_failure", [False, True])
+def test_per_attempt_provider_call_limit_is_terminal_budget_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publication_failure: bool
+) -> None:
+    from ithrl.cli.fuzz_run import publish_fuzz_result
+    from ithrl.runner import RunnerError, RunnerErrorCode
+
+    args, runner, _ = mock_native(tmp_path, monkeypatch)
+
+    async def exhausted(attempt: PreparedAttempt) -> RunResult:
+        runner.calls.append(attempt)
+        raise RunnerError(RunnerErrorCode.PROVIDER_CALL_LIMIT, "provider-call-limit")
+
+    monkeypatch.setattr(runner, "run", exhausted)
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(app, [*args, "--detect", "--profile", str(profile)])
+    assert detected.exit_code == 0, detected.output
+    if publication_failure:
+
+        def fail_publication(*_args: object) -> Path:
+            raise OSError("PRIVATE-PUBLICATION-FAILURE")
+
+        monkeypatch.setattr("ithrl.cli.fuzz_run.publish_fuzz_result", fail_publication)
+    result = CliRunner().invoke(
+        app, [*args, "--profile", str(profile), "--acknowledge-model-execution"]
+    )
+    assert result.exit_code == (ExitCode.INTERNAL if publication_failure else ExitCode.BUDGET), (
+        result.output
+    )
+    report = json.loads(result.stdout)
+    assert report["runner_error_category"] == "provider-call-limit"
+    assert report["calibration"]["runner_errors"] == 1
+    assert report["calibration"]["no_matches"] == 0
+    assert report["next_command"] is None
+    if publication_failure:
+        assert report["error_code"] == "result-publication-failed"
+        assert "PRIVATE-PUBLICATION-FAILURE" not in result.output
+    else:
+        assert "different limit requires a new run" in report["next_action"]
+    assert len(runner.calls) == 1
+    monkeypatch.setattr("ithrl.cli.fuzz_run.publish_fuzz_result", publish_fuzz_result)
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "fuzz",
+            report["run_state_path"] if publication_failure else report["result_path"],
+            "--resume",
+            "--acknowledge-model-execution",
+            "--format",
+            "json",
+        ],
+    )
+    assert resumed.exit_code == ExitCode.BUDGET, resumed.output
+    assert len(runner.calls) == 1
+
+
+def test_saved_native_per_attempt_limit_is_reused_and_conflicting_override_never_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, runner, detections = mock_native(tmp_path, monkeypatch, source_backed=True)
+    profile = tmp_path / "profile.json"
+    detected = CliRunner().invoke(
+        app, [*args, "--detect", "--profile", str(profile), "--max-provider-calls-per-attempt", "1"]
+    )
+    assert detected.exit_code == 0, detected.output
+    assert json.loads(detected.stdout)["max_provider_calls_per_attempt"] == 1
+    profile_args = [*args, "--profile", str(profile)]
+    conflict = CliRunner().invoke(
+        app, [*profile_args, "--dry-run", "--max-provider-calls-per-attempt", "2"]
+    )
+    assert json.loads(conflict.stdout)["error_code"] == "profile-provider-call-limit-mismatch"
+    assert len(detections) == 1
+    assert not runner.calls
+    completed = CliRunner().invoke(app, [*profile_args, "--acknowledge-model-execution"])
+    assert completed.exit_code == 0, completed.output
+    report = json.loads(completed.stdout)
+    before = len(runner.calls)
+    assert report["max_provider_calls_per_attempt"] == 1
+    for limit, expected in (("1", 0), ("2", ExitCode.UNSUPPORTED)):
+        resumed = CliRunner().invoke(
+            app,
+            [
+                "fuzz",
+                report["result_path"],
+                "--resume",
+                "--acknowledge-model-execution",
+                "--max-provider-calls-per-attempt",
+                limit,
+                "--format",
+                "json",
+            ],
+        )
+        assert resumed.exit_code == expected, resumed.output
+        assert len(runner.calls) == before
+
+
+def test_fuzz_preparation_preserves_a_sampled_task_grader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ithrl.execution.preflight as preflight
+    from ithrl.case import CaseWorkspace
+    from ithrl.cli.fuzz import prepare_fuzz_profile
+    from ithrl.experiment import (
+        FakeRunnerConfig,
+        FinalResponseTarget,
+        SampledCalibrationPhase,
+        SampledExperimentDefinition,
+        StructuralOracleConfig,
+    )
+    from ithrl.fuzz.configuration import FuzzConfiguration
+    from ithrl.grading.contracts import PatchGradingConfig
+
+    inputs(tmp_path)
+    workspace = CaseWorkspace.open(tmp_path / "case")
+    grading = PatchGradingConfig(
+        bundle_path=str(tmp_path / "task"),
+        bundle_digest="a" * 64,
+        environment_path=str(tmp_path / "env"),
+        environment_digest="b" * 64,
+        timeout_seconds=1,
+    )
+    experiment = SampledExperimentDefinition(
+        target=FinalResponseTarget(),
+        oracle=StructuralOracleConfig(),
+        runner=FakeRunnerConfig(required_markers=("fixture",), final_text="patch"),
+        calibration=SampledCalibrationPhase(required_valid=1, minimum_matches=1, max_attempts=1),
+        grading=grading,
+    )
+    (workspace.root / "experiments/default.toml").write_text(experiment.to_toml())
+
+    def available(_input: object) -> None:
+        pass
+
+    monkeypatch.setattr(preflight, "validate_grading", available)
+    monkeypatch.setattr(preflight, "validate_grading_runtime", available)
+    config = FuzzConfiguration.from_toml(
+        CONFIGURATION.replace("attempt_timeout_seconds = 1", "attempt_timeout_seconds = 10")
+    )
+    profile, prepared = prepare_fuzz_profile(workspace, config, None, detect=False)
+    assert isinstance(prepared.experiment, SampledExperimentDefinition)
+    assert prepared.experiment.grading == profile.execution_plan.grading == grading
+    assert prepared.execution_plan.grading is not None
+    assert prepared.execution_plan.grading.digest == grading.digest

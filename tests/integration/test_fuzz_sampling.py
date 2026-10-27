@@ -1,0 +1,466 @@
+"""Credential-free change comparisons through actual reservations and observation storage."""
+
+from __future__ import annotations
+
+import asyncio
+from collections import Counter
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from ithrl.execution.budget import SamplingAttemptCost
+from ithrl.experiment import ExperimentDefinition, SampledCalibrationPhase
+from ithrl.fuzz import FuzzOutcome
+from ithrl.fuzz.sampling import (
+    confirm_fuzz_block,
+    confirm_fuzz_evidence,
+    fuzz_block_plan,
+    fuzz_budget_bounds,
+    prepare_fuzz_sampling,
+    screen_fuzz_block,
+    screen_fuzz_evidence,
+)
+from ithrl.fuzz.simplify import MutationDecision
+from ithrl.mutation import TextMutation
+from ithrl.observations import SamplingBlockEvidence
+from ithrl.reduce.contracts import SampledConfirmation
+from ithrl.sampling import SamplingCollectionResult, collect_sampling_block
+
+pytest.importorskip("scipy")
+
+
+from fuzz_support import setup
+
+
+@pytest.mark.parametrize("fault", ["identity", "empty-mutation"])
+def test_fuzz_block_admission_refuses_unbound_or_empty_interventions(
+    tmp_path: Path, fault: str
+) -> None:
+    evidence, prepared, campaign, runner, _, _, mutation = setup(tmp_path)
+    if fault == "identity":
+        prepared = replace(
+            prepared, identity=prepared.identity.model_copy(update={"algorithm_digest": "f" * 64})
+        )
+    else:
+        mutation = TextMutation()
+    with pytest.raises(
+        ValueError, match=r"campaign-bound sampling identities|nonempty intervention"
+    ):
+        fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="discovery",
+            block_id="refused-block",
+            frozen_at=datetime.now(UTC),
+            schedule_seed=1,
+        )
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("delay", [-1, 86_401, True, 1.5])
+def test_fuzz_budget_refuses_invalid_pacing(tmp_path: Path, delay: Any) -> None:
+    _, _, campaign, _, _, _, _ = setup(tmp_path)
+    with pytest.raises(ValueError, match="bounded nonnegative"):
+        fuzz_budget_bounds(
+            campaign,
+            SamplingAttemptCost(provider_calls=1, runner_seconds=1),
+            inter_attempt_delay_seconds=delay,
+        )
+
+
+def test_fuzz_decisions_require_the_correct_sampling_role(tmp_path: Path) -> None:
+    evidence, prepared, campaign, runner, state, store, mutation = setup(tmp_path)
+    frozen = datetime.now(UTC)
+    plan = fuzz_block_plan(
+        evidence=evidence,
+        prepared=prepared,
+        campaign=campaign,
+        mutation=mutation,
+        role="discovery",
+        block_id="discovery-1",
+        frozen_at=frozen,
+        schedule_seed=1,
+    )
+    block = SamplingBlockEvidence(plan=plan, attempts=())
+    with state.acquire_lock(store):
+        usage = state.usage(store, now=frozen)
+    with pytest.raises(ValueError, match="fresh selected comparison"):
+        confirm_fuzz_evidence(block)
+    with pytest.raises(ValueError, match="fresh selected comparison"):
+        confirm_fuzz_block(SamplingCollectionResult(evidence=block, usage=usage, stop_reason=None))
+    confirmation = fuzz_block_plan(
+        evidence=evidence,
+        prepared=prepared,
+        campaign=campaign,
+        mutation=mutation,
+        role="confirmation",
+        block_id="confirmation-1",
+        frozen_at=frozen + timedelta(microseconds=1),
+        selected_at=frozen,
+        schedule_seed=1,
+    )
+    with pytest.raises(ValueError, match="exploratory change evidence"):
+        screen_fuzz_evidence(SamplingBlockEvidence(plan=confirmation, attempts=()))
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("changed", ["experiment", "calibration", "original"])
+def test_sampling_refuses_unbound_campaign_inputs_before_dispatch(
+    tmp_path: Path, changed: str
+) -> None:
+    evidence, prepared, campaign, runner, _, _, _ = setup(tmp_path)
+    if changed == "experiment":
+        prepared = replace(
+            prepared, experiment=ExperimentDefinition.from_toml(evidence.default_experiment)
+        )
+        message = "sampled fuzzing requires a sampled experiment"
+    elif changed == "calibration":
+        prepared = replace(
+            prepared,
+            experiment=prepared.experiment.model_copy(
+                update={
+                    "calibration": SampledCalibrationPhase(
+                        required_valid=1, minimum_matches=1, max_attempts=1
+                    )
+                }
+            ),
+        )
+        message = "campaign calibration differs"
+    else:
+        campaign = campaign.model_copy(
+            update={
+                "original": campaign.original.model_copy(update={"execution_plan_digest": "f" * 64})
+            }
+        )
+        message = "campaign original differs"
+    with pytest.raises(ValueError, match=message):
+        prepare_fuzz_sampling(evidence, prepared, campaign)
+    assert runner.calls == []
+
+
+def test_discovery_simplification_and_fresh_confirmation_use_separate_owned_samples(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(tmp_path)
+        before = evidence.request
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="discovery",
+            block_id="discovery-1",
+            frozen_at=datetime.now(UTC),
+            schedule_seed=1,
+        )
+        first = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert screen_fuzz_block(first) is MutationDecision.CHANGED
+        assert first.usage.actual_provider_calls == 16
+        with state.acquire_lock(store):
+            state.archive_block(store)
+        mutation = TextMutation(
+            edits=(mutation.edits[0].model_copy(update={"text": "\n\nsynthetic"}),)
+        )
+        simplified_plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="simplification",
+            block_id="simplification-1",
+            frozen_at=datetime.now(UTC),
+            schedule_seed=3,
+        )
+        simplified = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=simplified_plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert screen_fuzz_block(simplified) is MutationDecision.CHANGED
+        with state.acquire_lock(store):
+            state.archive_block(store)
+        selected = datetime.now(UTC)
+        holdout = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="confirmation",
+            block_id="holdout-1",
+            frozen_at=selected + timedelta(microseconds=1),
+            selected_at=selected,
+            schedule_seed=2,
+        )
+        final = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=holdout,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert confirm_fuzz_block(final).outcome is FuzzOutcome.CONFIRMED_CHANGE
+        assert not set(first.evidence.observation_ids) & set(final.evidence.observation_ids)
+        assert final.usage.actual_provider_calls == 72
+        assert Counter((a.phase, a.arm) for a in runner.calls) == {
+            ("discovery", "baseline"): 8,
+            ("discovery", "candidate"): 8,
+            ("simplification", "baseline"): 8,
+            ("simplification", "candidate"): 8,
+            ("confirmation", "baseline"): 20,
+            ("confirmation", "candidate"): 20,
+        }
+        assert all(a.candidate == campaign.original for a in runner.calls if a.arm == "baseline")
+        assert evidence.request == before
+        with state.acquire_lock(store):
+            state.archive_block(store)
+        repeated = holdout.model_copy(update={"block_id": "holdout-2"})
+        refused = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=repeated,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert refused.stop_reason == "confirmation-already-started"
+        assert len(runner.calls) == 72
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("calls_per_attempt", [1, 2])
+def test_exploration_cannot_spend_the_complete_confirmation_budget(
+    tmp_path: Path, calls_per_attempt: int
+) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(
+            tmp_path, limit=107 * calls_per_attempt, calls_per_attempt=calls_per_attempt
+        )
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="simplification",
+            block_id="trial-1",
+            frozen_at=datetime.now(UTC),
+            schedule_seed=0,
+        )
+        result = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert result.stop_reason == "provider-call-budget"
+        assert not runner.calls
+        with state.acquire_lock(store):
+            assert not state.load(store).blocks
+        assert screen_fuzz_block(result) is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("calls_per_attempt", [1, 2])
+def test_error_does_not_become_a_behavioral_loss_or_confirmed_finding(
+    tmp_path: Path, calls_per_attempt: int
+) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(
+            tmp_path, calls_per_attempt=calls_per_attempt
+        )
+        runner.fail = True
+        selected = datetime.now(UTC)
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="confirmation",
+            block_id="holdout-1",
+            frozen_at=selected + timedelta(microseconds=1),
+            selected_at=selected,
+            schedule_seed=0,
+        )
+        result = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert not result.complete
+        assert confirm_fuzz_block(result).outcome is FuzzOutcome.INCOMPLETE
+        assert result.usage.actual_provider_calls == 0
+        assert result.usage.possible_provider_calls == calls_per_attempt
+        assert result.usage.charged_provider_calls == calls_per_attempt
+        assert result.usage.unknown_provider_attempts == 1
+        with pytest.raises(ValueError, match="reduction procedure"):
+            SampledConfirmation.from_evidence(result.evidence)
+        assert result.evidence.original_counts.valid + result.evidence.candidate_counts.valid == 0
+        assert (
+            result.evidence.original_counts.runner_errors
+            + result.evidence.candidate_counts.runner_errors
+            == 1
+        )
+        assert len(runner.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_equal_rates_complete_as_inconclusive(tmp_path: Path) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(tmp_path)
+        runner.mutant_matches = True
+        selected = datetime.now(UTC)
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="confirmation",
+            block_id="null-holdout",
+            selected_at=selected,
+            frozen_at=selected + timedelta(microseconds=1),
+            schedule_seed=2,
+        )
+        result = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        classified = confirm_fuzz_block(result)
+        assert classified.outcome is FuzzOutcome.INCONCLUSIVE
+        assert classified.difference == 0
+        assert result.evidence.original_counts.matches == 20
+        assert result.evidence.candidate_counts.matches == 20
+
+    asyncio.run(run())
+
+
+def test_decimal_screen_threshold_includes_exact_equality(tmp_path: Path) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(
+            tmp_path, screen_valid=5, screen_attempts=5
+        )
+        runner.original_matching, runner.mutant_matching = 3, 1
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="discovery",
+            block_id="boundary",
+            frozen_at=datetime.now(UTC),
+            schedule_seed=0,
+        )
+        result = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+        )
+        assert result.evidence.original_counts.matches == 3
+        assert result.evidence.candidate_counts.matches == 1
+        assert screen_fuzz_block(result) is MutationDecision.CHANGED
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changes", [{"required_valid": 4}, {"max_attempts": 8}])
+def test_campaign_calibration_must_match_actual_execution_limits(
+    tmp_path: Path, changes: dict[str, int]
+) -> None:
+    evidence, prepared, campaign, runner, _state, _store, _mutation = setup(tmp_path)
+    different = campaign.model_copy(
+        update={"calibration": campaign.calibration.model_copy(update=changes)}
+    )
+    with pytest.raises(ValueError, match="campaign calibration differs"):
+        prepare_fuzz_sampling(evidence, prepared, different)
+    assert not runner.calls
+
+
+@pytest.mark.parametrize(
+    "reason", ["wall-time-budget", "token-estimate-unavailable", "freshness-budget"]
+)
+def test_time_freshness_and_unenforceable_tokens_refuse_before_dispatch(
+    tmp_path: Path, reason: str
+) -> None:
+    async def run() -> None:
+        evidence, prepared, campaign, runner, state, store, mutation = setup(
+            tmp_path,
+            max_wall_time_seconds=539 if reason == "wall-time-budget" else 100_000,
+            max_tokens=1 if reason == "token-estimate-unavailable" else None,
+        )
+        frozen_at = datetime.now(UTC)
+        plan = fuzz_block_plan(
+            evidence=evidence,
+            prepared=prepared,
+            campaign=campaign,
+            mutation=mutation,
+            role="discovery",
+            block_id="refused",
+            frozen_at=frozen_at,
+            schedule_seed=1,
+        )
+        clock = (
+            (lambda: plan.expires_at - timedelta(seconds=1))
+            if reason == "freshness-budget"
+            else lambda: datetime.now(UTC)
+        )
+        result = await collect_sampling_block(
+            evidence=evidence,
+            original=prepared,
+            candidate=prepared,
+            removed_context_ids=(),
+            plan=plan,
+            state_file=state,
+            store=store,
+            mutation=mutation,
+            clock=clock,
+        )
+        assert result.stop_reason == reason
+        assert not runner.calls
+
+    asyncio.run(run())
