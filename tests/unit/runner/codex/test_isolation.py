@@ -1,0 +1,521 @@
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import MappingProxyType
+from unittest.mock import Mock
+
+import pytest
+
+import ithrl.runner.codex.isolation as isolation
+from ithrl.runner.codex.configuration import CodexProviderConfiguration
+from ithrl.runner.codex.isolation import (
+    CodexIsolationError,
+    CodexRuntime,
+    _bubblewrap_boundary,
+    prepare_codex_process,
+    program_digest,
+)
+from ithrl.runner.runtime import OwnedAttemptState
+
+ATTEMPT_ID = "attempt-00000000000000000000000000000001"
+
+
+def _configuration(
+    *,
+    auth_data: bytes | None = None,
+    environment: dict[str, str] | None = None,
+) -> CodexProviderConfiguration:
+    selected = environment or {}
+    return CodexProviderConfiguration(
+        source_provider_id="fixture-provider",
+        provider_id="ithrl",
+        endpoint="https://example.invalid/v1/responses",
+        authentication="custom-environment",
+        environment_names=tuple(sorted(selected)),
+        deviations=("provider-request-retries-disabled",),
+        rendered_config=b'model_provider = "ithrl"\n',
+        environment=MappingProxyType(selected),
+        auth_data=auth_data,
+    )
+
+
+def _program(path: Path, text: str = "pass\n") -> Path:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def test_prepares_private_worker_state_and_minimal_environment(tmp_path: Path) -> None:
+    state = OwnedAttemptState.create(tmp_path / "state", ATTEMPT_ID)
+    worker = _program(tmp_path / "worker.py")
+    protocol = _program(tmp_path / "protocol.py")
+    contracts = _program(tmp_path / "protocol_contracts.py")
+    executable = Path("/bin/true")
+
+    spec = prepare_codex_process(
+        state,
+        runtime=CodexRuntime(
+            codex=executable,
+            bubblewrap=executable,
+            python=executable,
+        ),
+        configuration=_configuration(
+            auth_data=b'{"token":"private-token"}\n',
+            environment={
+                "ITHRL_PROVIDER_SECRET_0": "private-key",
+                "HTTPS_PROXY": "http://private-proxy.invalid",
+            },
+        ),
+        request={"private_prompt": "do not expose"},
+        worker_source=worker,
+        worker_digest=program_digest(worker),
+        support_programs=(
+            (protocol, program_digest(protocol)),
+            (contracts, program_digest(contracts)),
+        ),
+    )
+
+    assert spec.cwd == state.root / "workspace"
+    assert spec.environment["HOME"] == "/tmp/ithrl-state/home"  # noqa: S108
+    assert spec.environment["CODEX_HOME"] == "/tmp/ithrl-state/codex-home"  # noqa: S108
+    assert spec.environment["ITHRL_PROVIDER_SECRET_0"] == "private-key"
+    assert "private-key" not in " ".join(spec.argv)
+    assert "private-token" not in " ".join(spec.argv)
+    assert "do not expose" not in " ".join(spec.argv)
+    assert "--tmpfs" in spec.argv
+    assert "/home" in spec.argv
+    assert "/tmp/ithrl-state/runner/codex" in spec.argv  # noqa: S108
+    assert spec.argv[-2:] == (
+        f"{isolation.SANDBOX_ROOT}/worker.py",
+        f"{isolation.SANDBOX_ROOT}/request.json",
+    )
+    assert stat.S_IMODE((state.root / "request.json").stat().st_mode) == 0o600
+    assert (state.root / "codex-home" / "config.toml").read_bytes() == (
+        b'model_provider = "ithrl"\n'
+    )
+    assert not (state.root / "codex-home" / "auth.json").exists()
+    assert len(spec.inherited_fds) == 1
+    assert "--ro-bind-data" in spec.argv
+    assert stat.S_IMODE((state.root / "worker.py").stat().st_mode) == 0o500
+    assert stat.S_IMODE((state.root / "protocol.py").stat().st_mode) == 0o500
+    assert stat.S_IMODE((state.root / "protocol_contracts.py").stat().st_mode) == 0o500
+    assert "private-token" not in repr(spec)
+    assert "private-key" not in repr(spec)
+    for descriptor in spec.inherited_fds:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "worker-digest",
+        "empty-support",
+        "duplicate-support",
+        "worker-support",
+        "request-size",
+        "workspace-exists",
+    ],
+)
+def test_preparation_refuses_invalid_worker_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    state = OwnedAttemptState.create(tmp_path / "state", ATTEMPT_ID)
+    worker = _program(tmp_path / "worker.py")
+    support = _program(tmp_path / "protocol.py")
+    programs = ((support, program_digest(support)),)
+    digest = program_digest(worker)
+    if invalid == "worker-digest":
+        digest = "0" * 64
+    elif invalid == "empty-support":
+        programs = ()
+    elif invalid == "duplicate-support":
+        programs = programs + programs
+    elif invalid == "worker-support":
+        programs = ((worker, digest),)
+    elif invalid == "workspace-exists":
+        (state.root / "workspace").mkdir(mode=0o700)
+    else:
+        monkeypatch.setattr(isolation, "MAX_WORKER_REQUEST_BYTES", 1)
+
+    with pytest.raises(CodexIsolationError):
+        prepare_codex_process(
+            state,
+            runtime=CodexRuntime(
+                codex=Path("/bin/true"), bubblewrap=Path("/bin/true"), python=Path("/bin/true")
+            ),
+            configuration=_configuration(),
+            request={"text": "private fixture input"},
+            worker_source=worker,
+            worker_digest=digest,
+            support_programs=programs,
+        )
+
+    assert not (state.root / "request.json").exists()
+    assert not (state.root / "codex-home" / "config.toml").exists()
+
+
+@pytest.mark.parametrize(
+    "failure", ["certificate", "command", "command-without-auth", "publication", "configuration"]
+)
+def test_preparation_failures_close_authentication_and_keep_errors_content_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from ithrl.case import CaseError
+
+    state = OwnedAttemptState.create(tmp_path / "state", ATTEMPT_ID)
+    worker = _program(tmp_path / "worker.py")
+    support = _program(tmp_path / "protocol.py")
+    descriptors: list[int] = []
+    original = isolation._memory_file
+
+    def remember(content: bytes | None) -> int | None:
+        descriptor = original(content)
+        if descriptor is not None:
+            descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(isolation, "_memory_file", remember)
+    if failure == "certificate":
+        monkeypatch.setattr(
+            isolation, "snapshot_certificate_files", Mock(side_effect=ValueError("private-detail"))
+        )
+    elif failure in {"command", "command-without-auth"}:
+        monkeypatch.setattr(
+            isolation,
+            "_bubblewrap_argv",
+            Mock(side_effect=CodexIsolationError("command unavailable")),
+        )
+    elif failure == "publication":
+        monkeypatch.setattr(
+            isolation, "atomic_write_bytes", Mock(side_effect=CaseError("private-detail"))
+        )
+    else:
+        write = isolation.atomic_write_bytes
+
+        def fail_configuration(path: Path, content: bytes) -> object:
+            if path.name == "config.toml":
+                raise CaseError("private-detail")
+            return write(path, content)
+
+        monkeypatch.setattr(isolation, "atomic_write_bytes", fail_configuration)
+    with pytest.raises(CodexIsolationError) as refused:
+        prepare_codex_process(
+            state,
+            runtime=CodexRuntime(
+                codex=Path("/bin/true"), bubblewrap=Path("/bin/true"), python=Path("/bin/true")
+            ),
+            configuration=_configuration(
+                auth_data=None if failure == "command-without-auth" else b"fixture-auth"
+            ),
+            request={"text": "fixture"},
+            worker_source=worker,
+            worker_digest=program_digest(worker),
+            support_programs=((support, program_digest(support)),),
+        )
+    assert "private-detail" not in str(refused.value)
+    assert len(descriptors) == (1 if failure == "command" else 0)
+    for descriptor in descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="requires Linux memfd")
+@pytest.mark.parametrize("failure", ["write-error", "short-write", "create-error"])
+def test_authentication_write_failure_closes_the_memory_file(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    descriptors: list[int] = []
+    create = os.memfd_create
+
+    def remember(name: str, flags: int) -> int:
+        descriptor = create(name, flags)
+        descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(os, "memfd_create", remember)
+    if failure == "create-error":
+        monkeypatch.setattr(os, "memfd_create", Mock(side_effect=OSError("private-create-detail")))
+    elif failure == "short-write":
+        monkeypatch.setattr(os, "write", Mock(return_value=0))
+    else:
+        monkeypatch.setattr(os, "write", Mock(side_effect=OSError("private-write-detail")))
+    with pytest.raises(CodexIsolationError, match="private Codex authentication"):
+        isolation._memory_file(b"fixture-auth")
+    assert len(descriptors) == (0 if failure == "create-error" else 1)
+    for descriptor in descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="requires Linux memfd")
+def test_authentication_moves_low_descriptors_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcntl
+
+    descriptor = os.memfd_create("fixture-auth", os.MFD_CLOEXEC)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "memfd_create", Mock(return_value=1))
+            duplicate = Mock(return_value=descriptor)
+            patched.setattr(fcntl, "fcntl", duplicate)
+            close = Mock()
+            patched.setattr(os, "close", close)
+            assert isolation._memory_file(b"fixture-auth") == descriptor
+            duplicate.assert_called_once_with(1, fcntl.F_DUPFD_CLOEXEC, 3)
+            close.assert_called_once_with(1)
+        assert os.read(descriptor, 12) == b"fixture-auth"
+        assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
+    finally:
+        os.close(descriptor)
+
+
+def test_empty_authentication_is_refused() -> None:
+    with pytest.raises(CodexIsolationError, match="private Codex authentication"):
+        isolation._memory_file(b"")
+
+
+@pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="requires Linux memfd")
+def test_auth_memory_file_avoids_standard_stream_descriptors() -> None:
+    script = """
+import os
+from ithrl.runner.codex.isolation import _memory_file
+
+os.close(0)
+descriptor = _memory_file(b"fixture-auth")
+assert descriptor is not None and descriptor >= 3
+assert os.read(descriptor, 12) == b"fixture-auth"
+os.close(descriptor)
+"""
+
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and test source
+        (sys.executable, "-c", script),
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+
+def test_configuration_rejects_undeclared_environment_fields() -> None:
+    with pytest.raises(ValueError, match="environment does not match"):
+        CodexProviderConfiguration(
+            source_provider_id="fixture-provider",
+            provider_id="ithrl",
+            endpoint="https://example.invalid/v1/responses",
+            authentication="custom-environment",
+            environment_names=(),
+            deviations=(),
+            rendered_config=b'model_provider = "ithrl"\n',
+            environment=MappingProxyType({"UNRELATED_SECRET": "private"}),
+        )
+
+
+def test_configuration_rejects_caller_selected_child_environment_name() -> None:
+    with pytest.raises(ValueError, match="unsafe name"):
+        _configuration(environment={"LD_PRELOAD": "private"})
+
+
+def test_current_managed_python_is_exposed_read_only_without_host_home(
+    tmp_path: Path,
+) -> None:
+    runtime = CodexRuntime(
+        codex=Path("/bin/true"),
+        bubblewrap=Path("/usr/bin/bwrap"),
+        python=Path(sys.executable),
+    )
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "runner").mkdir()
+    hidden = tmp_path / "hidden-home-marker"
+    hidden.write_text("private", encoding="utf-8")
+    script = (
+        "import json,encodings,sys; from pathlib import Path; "
+        f"assert not Path({str(hidden)!r}).exists(); "
+        "assert Path(sys.executable).is_file(); "
+        "Path('/tmp/ithrl-state/proof').write_text('ok')"
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed test interpreter and synthetic code
+        (*_bubblewrap_boundary(runtime, state=root), str(runtime.python), "-c", script),
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert (root / "proof").read_text() == "ok"
+    assert hidden.read_text() == "private"
+    if runtime._python_prefix is not None:
+        assert str(runtime._python_prefix) in completed.args
+        assert sysconfig.get_path("stdlib").startswith(str(runtime._python_prefix))
+
+
+def test_refuses_unproven_python_installation_under_a_hidden_home(tmp_path: Path) -> None:
+    pretend_python = _program(tmp_path / "python")
+    with pytest.raises(CodexIsolationError, match="cannot be safely exposed"):
+        CodexRuntime(
+            codex=Path("/bin/true"),
+            bubblewrap=Path("/usr/bin/bwrap"),
+            python=pretend_python,
+        )
+
+
+def test_system_python_needs_no_hidden_runtime_mount() -> None:
+    runtime = CodexRuntime(
+        codex=Path("/bin/true"),
+        bubblewrap=Path("/usr/bin/bwrap"),
+        python=Path("/usr/bin/python3"),
+    )
+    assert runtime._python_prefix is None
+
+
+@pytest.mark.parametrize("parent_kind", ["temporary", "checkout"])
+@pytest.mark.parametrize("venv_symlink", [False, True])
+def test_proves_current_runtime_layout_independent_of_installed_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_kind: str,
+    venv_symlink: bool,
+) -> None:
+    parent = tmp_path if parent_kind == "temporary" else Path.cwd()
+    with TemporaryDirectory(prefix=".ithrl-test-runtime-", dir=parent) as temporary:
+        prefix = Path(temporary)
+        if not prefix.is_relative_to("/tmp") and not prefix.is_relative_to("/home"):  # noqa: S108
+            pytest.skip("checkout is outside the masked runtime roots")
+        (prefix / "bin").mkdir()
+        python = _program(prefix / "bin" / "python")
+        stdlib = prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        (stdlib / "encodings").mkdir(parents=True)
+        (stdlib / "encodings" / "__init__.py").write_text("", encoding="utf-8")
+        selected = python
+        if venv_symlink:
+            (prefix / "venv" / "bin").mkdir(parents=True)
+            selected = prefix / "venv" / "bin" / "python"
+            selected.symlink_to(python)
+        monkeypatch.setattr(isolation.sys, "executable", str(selected))
+        monkeypatch.setattr(isolation.sys, "base_prefix", str(prefix))
+
+        def stdlib_path(_name: str) -> str:
+            return str(stdlib)
+
+        monkeypatch.setattr(isolation.sysconfig, "get_path", stdlib_path)
+
+        runtime = CodexRuntime(
+            codex=Path("/bin/true"),
+            bubblewrap=Path("/usr/bin/bwrap"),
+            python=selected,
+        )
+        assert runtime.python == python
+        assert runtime._python_prefix == prefix
+        runtime.assert_unchanged()
+        boundary = _bubblewrap_boundary(runtime, state=prefix.parent / "attempt-state")
+        assert boundary[-3:] == ("--ro-bind", str(prefix), str(prefix))
+        with pytest.raises(CodexIsolationError, match="overlaps disposable state"):
+            _bubblewrap_boundary(runtime, state=prefix / "attempt-state")
+
+
+@pytest.mark.parametrize(
+    "error", [OSError("private-layout-detail"), TypeError("private-layout-detail")]
+)
+def test_runtime_layout_errors_are_content_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr(isolation.sysconfig, "get_path", Mock(side_effect=error))
+    with pytest.raises(CodexIsolationError, match="layout is unavailable") as refused:
+        isolation._python_runtime_prefix(tmp_path / "python")
+    assert "private-layout-detail" not in str(refused.value)
+
+
+def test_private_directory_refuses_replacement_after_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mkdir = Path.mkdir
+
+    def replace_directory(
+        path: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+        path.rmdir()
+        path.write_bytes(b"fixture replacement")
+
+    monkeypatch.setattr(Path, "mkdir", replace_directory)
+    target = tmp_path / "private"
+    with pytest.raises(CodexIsolationError, match="unsafe directory"):
+        isolation._private_directory(target)
+    assert target.read_bytes() == b"fixture replacement"
+
+
+@pytest.mark.parametrize("fault", ["relative", "missing", "nonexecutable"])
+def test_runtime_executables_require_existing_absolute_executable_files(
+    tmp_path: Path, fault: str
+) -> None:
+    path = tmp_path / "program"
+    if fault == "relative":
+        with pytest.raises(ValueError, match="paths must be absolute"):
+            isolation._read_executable(Path("relative"))
+        return
+    if fault == "nonexecutable":
+        path.write_bytes(b"fixture")
+        path.chmod(0o600)
+    with pytest.raises(CodexIsolationError, match="executable is unavailable"):
+        isolation._read_executable(path)
+
+
+@pytest.mark.parametrize("prefix", [Path("/tmp"), Path("/home/fixture-account"), Path.home()])  # noqa: S108
+def test_refuses_broad_runtime_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: Path,
+) -> None:
+    python = prefix / "bin" / "python"
+    stdlib = prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    monkeypatch.setattr(isolation.sys, "executable", str(python))
+    monkeypatch.setattr(isolation.sys, "base_prefix", str(prefix))
+
+    def stdlib_path(_name: str) -> str:
+        return str(stdlib)
+
+    def resolved(self: Path, strict: bool = False) -> Path:
+        del strict
+        return self
+
+    def existing_file(_self: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(isolation.sysconfig, "get_path", stdlib_path)
+    monkeypatch.setattr(Path, "resolve", resolved)
+    monkeypatch.setattr(Path, "is_file", existing_file)
+
+    with pytest.raises(CodexIsolationError, match="cannot be safely exposed"):
+        isolation._python_runtime_prefix(python)
+
+
+def test_refuses_stdlib_encodings_symlink_escaping_exact_runtime_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = tmp_path / "runtime"
+    (prefix / "bin").mkdir(parents=True)
+    python = _program(prefix / "bin" / "python")
+    stdlib = prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    (stdlib / "encodings").mkdir(parents=True)
+    outside = tmp_path / "outside.py"
+    outside.write_text("", encoding="utf-8")
+    (stdlib / "encodings" / "__init__.py").symlink_to(outside)
+    monkeypatch.setattr(isolation.sys, "executable", str(python))
+    monkeypatch.setattr(isolation.sys, "base_prefix", str(prefix))
+
+    def stdlib_path(_name: str) -> str:
+        return str(stdlib)
+
+    monkeypatch.setattr(isolation.sysconfig, "get_path", stdlib_path)
+
+    with pytest.raises(CodexIsolationError, match="cannot be safely exposed"):
+        isolation._python_runtime_prefix(python)
