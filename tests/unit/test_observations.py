@@ -1,0 +1,863 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from datetime import UTC, datetime, timedelta, timezone
+from functools import partial
+from pathlib import Path
+from threading import Barrier
+
+import pytest
+from pydantic import ValidationError
+
+from ithrl.observations import (
+    Observation,
+    ObservationArm,
+    ObservationConflictError,
+    ObservationIdentity,
+    ObservationOutcome,
+    ObservationRole,
+    ObservationStore,
+    ObservationStoreBusyError,
+    ObservationStoreError,
+    UnsupportedObservationSchemaError,
+)
+from ithrl.runner import AttemptEvidence, ProviderAcceptanceState, RunAccounting
+
+_TEST_DIGEST = "0" * 64
+
+
+def _observation(
+    *,
+    attempt: int,
+    outcome: ObservationOutcome = ObservationOutcome.MATCH,
+    error_category: str | None = None,
+    **changes: object,
+) -> Observation:
+    values: dict[str, object] = {
+        "case_digest": "case",
+        "candidate_digest": "candidate",
+        "experiment_digest": "experiment",
+        "runner_fingerprint": "fake-v1",
+        "execution_plan_digest": "plan-v1",
+        "target_digest": "target",
+        "algorithm_digest": "deterministic-ddmin-v1",
+        "role": ObservationRole.SEARCH,
+        "arm": ObservationArm.CANDIDATE,
+        "attempt": attempt,
+        "outcome": outcome,
+        "error_category": error_category,
+        "attempt_evidence": (
+            AttemptEvidence(
+                attempt_id="attempt-" + "0" * 32,
+                attempt_digest=_TEST_DIGEST,
+                termination_reason="failed",
+                provider_acceptance_state=ProviderAcceptanceState.NOT_STARTED,
+            )
+            if outcome is ObservationOutcome.RUNNER_ERROR
+            else AttemptEvidence(
+                attempt_id="attempt-" + "0" * 32,
+                attempt_digest=_TEST_DIGEST,
+                termination_reason="completed",
+                provider_acceptance_state=ProviderAcceptanceState.NOT_STARTED,
+                effective_policy_digest=_TEST_DIGEST,
+                accounting=RunAccounting(),
+            )
+        ),
+    }
+    values.update(changes)
+    return Observation.model_validate(values)
+
+
+def _identity(**changes: str) -> ObservationIdentity:
+    values = {
+        "case_digest": "case",
+        "experiment_digest": "experiment",
+        "runner_fingerprint": "fake-v1",
+        "execution_plan_digest": "plan-v1",
+        "target_digest": "target",
+        "algorithm_digest": "deterministic-ddmin-v1",
+    }
+    values.update(changes)
+    return ObservationIdentity(**values)
+
+
+def _reusable(
+    store: ObservationStore, identity: ObservationIdentity | None = None
+) -> tuple[Observation, ...]:
+    return store.list_compatible(
+        identity or _identity(),
+        candidate_digest="candidate",
+        role=ObservationRole.SEARCH,
+        arm=ObservationArm.CANDIDATE,
+    )
+
+
+@pytest.mark.parametrize("resolver", ["get", "get_many", "get_attempt"])
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("recorded_at", "not-a-timestamp"), ("attempt_evidence", '{"termination_reason":"unknown"}')],
+)
+def test_authoritative_resolvers_reject_corrupt_rows(
+    tmp_path: Path, resolver: str, column: str, value: str
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observation = _observation(attempt=1)
+    store.append(observation)
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'observations_no_update'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER observations_no_update")
+        # The two column names are fixed test parameters; row content stays bound.
+        connection.execute(
+            f"UPDATE observations SET {column} = ? WHERE observation_id = ?",  # noqa: S608
+            (value, observation.observation_id),
+        )
+        connection.execute(trigger)
+
+    resolve = {
+        "get": partial(store.get, observation.observation_id),
+        "get_many": partial(store.get_many, (observation.observation_id,)),
+        "get_attempt": partial(
+            store.get_attempt,
+            _identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=1,
+        ),
+    }[resolver]
+    with pytest.raises(ObservationStoreError, match="stored observation is invalid"):
+        resolve()
+
+
+@pytest.mark.parametrize("query", ["get", "get_many", "attempt_counts", "record_attempt"])
+def test_sqlite_failure_after_schema_validation_preserves_existing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observation = _observation(attempt=1)
+    store.append(observation)
+    initialize = store.initialize
+    invoke = {
+        "get": partial(store.get, observation.observation_id),
+        "get_many": partial(store.get_many, (observation.observation_id,)),
+        "attempt_counts": partial(
+            store.attempt_counts,
+            _identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+        ),
+        "record_attempt": partial(
+            store.record_attempt,
+            identity=_identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            outcome=ObservationOutcome.MATCH,
+            attempt_evidence=observation.attempt_evidence,
+        ),
+    }[query]
+
+    @contextmanager
+    def unavailable() -> Generator[sqlite3.Connection, None, None]:
+        raise sqlite3.OperationalError("injected storage failure")
+        yield
+
+    with monkeypatch.context() as patch:
+
+        def initialize_then_fail() -> None:
+            initialize()
+            patch.setattr(store, "_connection", unavailable)
+
+        patch.setattr(store, "initialize", initialize_then_fail)
+        with pytest.raises(ObservationStoreError) as caught:
+            invoke()
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+    assert store.get(observation.observation_id) == observation
+    assert _reusable(store) == (observation,)
+
+
+@pytest.mark.parametrize("outcome", [ObservationOutcome.MATCH, ObservationOutcome.RUNNER_ERROR])
+def test_behavior_verdict_and_attempt_completion_cannot_disagree(
+    outcome: ObservationOutcome,
+) -> None:
+    opposite = _observation(
+        attempt=1,
+        outcome=ObservationOutcome.RUNNER_ERROR
+        if outcome is ObservationOutcome.MATCH
+        else ObservationOutcome.MATCH,
+        error_category="transport" if outcome is ObservationOutcome.MATCH else None,
+    ).attempt_evidence
+    with pytest.raises(ValidationError, match="attempt evidence"):
+        _observation(
+            attempt=1,
+            outcome=outcome,
+            error_category="transport" if outcome is ObservationOutcome.RUNNER_ERROR else None,
+            attempt_evidence=opposite,
+        )
+
+
+def test_database_directory_is_refused_without_changing_it(tmp_path: Path) -> None:
+    path = tmp_path / "observations.sqlite"
+    path.mkdir()
+    marker = path / "evidence"
+    marker.write_bytes(b"preserved")
+    with pytest.raises(ObservationStoreError):
+        ObservationStore(path).initialize()
+    assert marker.read_bytes() == b"preserved"
+
+
+@pytest.mark.parametrize(
+    "operation", ["get", "experiment", "compatible", "attempt", "counts", "record"]
+)
+def test_empty_evidence_selectors_are_rejected_before_creating_a_database(
+    tmp_path: Path, operation: str
+) -> None:
+    store = ObservationStore(tmp_path / "missing.sqlite")
+    identity = _identity()
+    evidence = _observation(attempt=1).attempt_evidence
+    invoke = {
+        "get": partial(store.get, ""),
+        "experiment": partial(store.list_for_experiment, ""),
+        "compatible": partial(
+            store.list_compatible,
+            identity,
+            candidate_digest="",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+        ),
+        "attempt": partial(
+            store.get_attempt,
+            identity,
+            candidate_digest="",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=1,
+        ),
+        "counts": partial(
+            store.attempt_counts,
+            identity,
+            candidate_digest="",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+        ),
+        "record": partial(
+            store.record_attempt,
+            identity=identity,
+            candidate_digest="",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            outcome=ObservationOutcome.MATCH,
+            attempt_evidence=evidence,
+        ),
+    }[operation]
+    with pytest.raises(ValueError, match="must not be empty"):
+        invoke()
+    assert not store.path.exists()
+
+
+def test_store_appends_repeated_candidate_observations(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "private" / "observations.sqlite")
+
+    store.append_many(
+        (
+            _observation(attempt=1),
+            _observation(attempt=2, outcome=ObservationOutcome.NO_MATCH),
+        )
+    )
+
+    observations = _reusable(store)
+    assert [item.target_observed for item in observations] == [True, False]
+    assert [item.valid for item in observations] == [True, True]
+    assert [item.attempt for item in observations] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("case_digest", "other-case"),
+        ("experiment_digest", "other-experiment"),
+        ("runner_fingerprint", "other-runner"),
+        ("execution_plan_digest", "other-plan"),
+        ("target_digest", "other-target"),
+        ("algorithm_digest", "other-algorithm"),
+    ],
+)
+def test_compatible_query_requires_every_reuse_identity(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append(_observation(attempt=1).model_copy(update={field: value}))
+
+    assert _reusable(store) == ()
+
+
+def test_compatible_query_can_filter_role_candidate_and_arm(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append_many(
+        (
+            _observation(attempt=1),
+            _observation(
+                attempt=1,
+                candidate_digest="original",
+                role=ObservationRole.CALIBRATION,
+                arm=ObservationArm.BASELINE,
+            ),
+        )
+    )
+
+    observations = store.list_compatible(
+        _identity(),
+        role=ObservationRole.CALIBRATION,
+        candidate_digest="original",
+        arm=ObservationArm.BASELINE,
+    )
+
+    assert len(observations) == 1
+    assert observations[0].candidate_digest == "original"
+
+
+def test_attempt_counts_distinguish_valid_and_operational_outcomes(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append_many(
+        (
+            _observation(attempt=1),
+            _observation(attempt=2, outcome=ObservationOutcome.NO_MATCH),
+            _observation(
+                attempt=3,
+                outcome=ObservationOutcome.INVALID_OBSERVATION,
+                error_category="oracle-contract",
+            ),
+            _observation(
+                attempt=4,
+                outcome=ObservationOutcome.RUNNER_ERROR,
+                error_category="transport",
+            ),
+        )
+    )
+
+    counts = store.attempt_counts(
+        _identity(),
+        candidate_digest="candidate",
+        role=ObservationRole.SEARCH,
+        arm=ObservationArm.CANDIDATE,
+    )
+
+    assert counts.attempts == 4
+    assert counts.valid_samples == 2
+    assert counts.matches == 1
+    assert counts.no_matches == 1
+    assert counts.invalid_observations == 1
+    assert counts.runner_errors == 1
+    assert counts.next_attempt == 5
+
+
+def test_attempt_count_is_scoped_to_exact_arm(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append(_observation(attempt=4))
+
+    counts = store.attempt_counts(
+        _identity(),
+        candidate_digest="candidate",
+        role=ObservationRole.SEARCH,
+        arm=ObservationArm.BASELINE,
+    )
+
+    assert counts.attempts == 0
+    assert counts.next_attempt == 1
+
+
+def test_record_attempt_allocates_same_arm_attempts_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "observations.sqlite"
+    workers = 8
+    ready = Barrier(workers)
+
+    def record(_index: int) -> Observation:
+        ready.wait()
+        return ObservationStore(path).record_attempt(
+            identity=_identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            outcome=ObservationOutcome.MATCH,
+            attempt_evidence=AttemptEvidence(
+                attempt_id="attempt-" + "0" * 32,
+                attempt_digest=_TEST_DIGEST,
+                termination_reason="completed",
+                provider_acceptance_state=ProviderAcceptanceState.NOT_STARTED,
+                effective_policy_digest=_TEST_DIGEST,
+                accounting=RunAccounting(),
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        observations = tuple(executor.map(record, range(workers)))
+
+    assert sorted(item.attempt for item in observations) == list(range(1, workers + 1))
+    assert len(_reusable(ObservationStore(path))) == workers
+
+
+@pytest.mark.parametrize("field", ["role", "arm", "outcome"])
+def test_observation_rejects_unknown_versioned_values(field: str) -> None:
+    values: dict[str, object] = {
+        "case_digest": "case",
+        "candidate_digest": "candidate",
+        "experiment_digest": "experiment",
+        "runner_fingerprint": "runner",
+        "execution_plan_digest": "plan",
+        "target_digest": "target",
+        "algorithm_digest": "algorithm",
+        "role": ObservationRole.SEARCH,
+        "arm": ObservationArm.CANDIDATE,
+        "attempt": 1,
+        "outcome": ObservationOutcome.MATCH,
+    }
+    values[field] = "future-value"
+
+    with pytest.raises(ValidationError):
+        Observation.model_validate(values)
+
+
+def test_observation_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError, match="unexpected"):
+        _observation(attempt=1, unexpected="value")
+
+
+def test_observation_requires_aware_timestamp_and_normalizes_to_utc() -> None:
+    with pytest.raises(ValidationError, match="UTC offset"):
+        _observation(attempt=1, recorded_at=datetime(2026, 1, 1))  # noqa: DTZ001
+
+    observation = _observation(
+        attempt=1,
+        recorded_at=datetime(2026, 1, 1, 2, tzinfo=timezone(timedelta(hours=2))),
+    )
+    assert observation.recorded_at == datetime(2026, 1, 1, tzinfo=UTC)
+    assert observation.recorded_at.tzinfo is UTC
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_category"),
+    [
+        (ObservationOutcome.MATCH, "unexpected"),
+        (ObservationOutcome.NO_MATCH, "unexpected"),
+        (ObservationOutcome.INVALID_OBSERVATION, None),
+        (ObservationOutcome.RUNNER_ERROR, None),
+    ],
+)
+def test_observation_enforces_outcome_error_consistency(
+    outcome: ObservationOutcome, error_category: str | None
+) -> None:
+    with pytest.raises(ValidationError):
+        _observation(attempt=1, outcome=outcome, error_category=error_category)
+
+
+def test_duplicate_attempt_is_rejected_without_replacing_first(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    first = _observation(attempt=1)
+    store.append(first)
+
+    with pytest.raises(ObservationConflictError):
+        store.append(_observation(attempt=1, outcome=ObservationOutcome.NO_MATCH))
+
+    assert _reusable(store) == (first,)
+
+
+def test_batch_append_is_atomic_on_conflict(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+
+    with pytest.raises(ObservationConflictError):
+        store.append_many((_observation(attempt=1), _observation(attempt=1)))
+
+    assert _reusable(store) == ()
+
+
+def test_existing_unversioned_store_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "observations.sqlite"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("CREATE TABLE observations (observation_id TEXT PRIMARY KEY)")
+
+    with pytest.raises(UnsupportedObservationSchemaError, match="schema version metadata"):
+        ObservationStore(path).initialize()
+
+
+def test_concurrent_first_initialization_uses_one_complete_schema(tmp_path: Path) -> None:
+    path = tmp_path / "observations.sqlite"
+    workers = 8
+    ready = Barrier(workers)
+
+    def initialize(_index: int) -> None:
+        ready.wait()
+        ObservationStore(path).initialize()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        tuple(executor.map(initialize, range(workers)))
+
+    ObservationStore(path).initialize()
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT value FROM ithrl_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("1",)
+
+
+def test_sqlite_initialization_errors_use_the_store_error_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+
+    def fail_connect(_path: Path) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr("ithrl.observations.sqlite3.connect", fail_connect)
+
+    with pytest.raises(ObservationStoreError, match="cannot initialize") as raised:
+        store.initialize()
+
+    assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+
+
+def test_unsupported_schema_version_fails_closed(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.initialize()
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("UPDATE ithrl_metadata SET value = '999' WHERE key = 'schema_version'")
+
+    with pytest.raises(UnsupportedObservationSchemaError, match="999"):
+        store.initialize()
+
+
+def test_incomplete_current_schema_fails_closed(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.initialize()
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("DROP INDEX observations_compatibility")
+
+    with pytest.raises(UnsupportedObservationSchemaError, match="schema objects"):
+        store.initialize()
+
+
+def test_modified_append_only_trigger_fails_closed(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.initialize()
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute("DROP TRIGGER observations_no_update")
+        connection.execute(
+            """
+            CREATE TRIGGER observations_no_update
+            BEFORE UPDATE ON observations
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+
+    with pytest.raises(UnsupportedObservationSchemaError, match="schema objects"):
+        store.initialize()
+
+
+def test_observation_rows_cannot_be_updated_or_deleted(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append(_observation(attempt=1))
+
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("UPDATE observations SET outcome = 'no_match'")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("DELETE FROM observations")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_store_uses_private_permissions(tmp_path: Path) -> None:
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o755)
+    parent_mode = directory.stat().st_mode & 0o777
+    store = ObservationStore(directory / "observations.sqlite")
+    store.initialize()
+
+    assert store.path.parent.stat().st_mode & 0o777 == parent_mode
+    assert store.path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_store_makes_a_new_parent_private(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "new-private" / "observations.sqlite")
+
+    store.initialize()
+
+    assert store.path.parent.stat().st_mode & 0o777 == 0o700
+    assert store.path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_store_file_is_private_if_schema_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ObservationStore(tmp_path / "private" / "observations.sqlite")
+
+    def fail_schema(_connection: sqlite3.Connection) -> None:
+        raise RuntimeError("schema creation failed")
+
+    monkeypatch.setattr(store, "_create_schema", fail_schema)
+    with pytest.raises(RuntimeError, match="schema creation failed"):
+        store.initialize()
+
+    assert store.path.stat().st_mode & 0o777 == 0o600
+
+
+def test_store_refuses_a_symbolic_link_database(tmp_path: Path) -> None:
+    target = tmp_path / "target.sqlite"
+    target.touch()
+    linked = tmp_path / "linked.sqlite"
+    linked.symlink_to(target)
+
+    with pytest.raises(ObservationStoreError, match="path contains a symbolic link"):
+        ObservationStore(linked).initialize()
+
+
+@pytest.mark.parametrize("operation", ["initialize", "acquire_sampling_lock"])
+def test_store_refuses_hard_link_before_changing_its_inode(tmp_path: Path, operation: str) -> None:
+    target = tmp_path / "target.sqlite"
+    target.write_bytes(b"private evidence")
+    target.chmod(0o640)
+    linked = tmp_path / "linked.sqlite"
+    linked.hardlink_to(target)
+    before = target.stat()
+    store = ObservationStore(linked)
+
+    if operation == "initialize":
+        with pytest.raises(ObservationStoreError, match="exactly one link"):
+            store.initialize()
+    else:
+        with (
+            pytest.raises(ObservationStoreError, match="exactly one link"),
+            store.acquire_sampling_lock(),
+        ):
+            pytest.fail("hard-linked database was locked")
+
+    assert target.read_bytes() == b"private evidence"
+    assert target.stat().st_mode == before.st_mode
+    assert not (tmp_path / "linked.sqlite.sampling.lock").exists()
+
+
+def test_store_refuses_a_symbolic_link_parent(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ObservationStoreError, match="path contains a symbolic link"):
+        ObservationStore(linked / "observations.sqlite").initialize()
+
+
+def test_store_refuses_a_symbolic_link_ancestor(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ObservationStoreError, match="path contains a symbolic link"):
+        ObservationStore(linked / "nested" / "observations.sqlite").initialize()
+
+
+def test_store_resolves_authoritative_observation_references(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observation = _observation(attempt=1)
+    store.append(observation)
+
+    assert store.get(observation.observation_id) == observation
+    assert store.get("missing") is None
+    assert store.get("' OR 1=1 --") is None
+    assert (
+        store.get_attempt(
+            _identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=1,
+        )
+        == observation
+    )
+
+
+def test_store_batch_reference_resolution_preserves_order(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observations = tuple(_observation(attempt=attempt) for attempt in range(1, 515))
+    store.append_many(observations)
+    references = tuple(item.observation_id for item in reversed(observations))
+
+    assert store.get_many(references) == tuple(reversed(observations))
+    assert store.get_many(()) == ()
+
+
+def test_store_batch_resolution_rejects_missing_and_duplicate_refs(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observation = _observation(attempt=1)
+    store.append(observation)
+
+    with pytest.raises(ObservationStoreError, match="missing evidence"):
+        store.get_many((observation.observation_id, "' OR 1=1 --"))
+    with pytest.raises(ValueError, match="unique"):
+        store.get_many((observation.observation_id, observation.observation_id))
+    with pytest.raises(ValueError, match="nonempty"):
+        store.get_many(("",))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "case_digest",
+        "experiment_digest",
+        "runner_fingerprint",
+        "execution_plan_digest",
+        "target_digest",
+        "algorithm_digest",
+    ],
+)
+def test_store_reserved_attempt_lookup_requires_exact_identity(tmp_path: Path, field: str) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append(_observation(attempt=1))
+
+    assert (
+        store.get_attempt(
+            _identity(**{field: "different"}),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=1,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("field", ["candidate_digest", "role", "arm", "attempt"])
+def test_store_reserved_attempt_lookup_requires_exact_arm(tmp_path: Path, field: str) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.append(_observation(attempt=1))
+
+    assert (
+        store.get_attempt(
+            _identity(),
+            candidate_digest="different" if field == "candidate_digest" else "candidate",
+            role=ObservationRole.CONFIRMATION if field == "role" else ObservationRole.SEARCH,
+            arm=ObservationArm.BASELINE if field == "arm" else ObservationArm.CANDIDATE,
+            attempt=2 if field == "attempt" else 1,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("attempt", [0, -1, True, 1.0])
+def test_store_reserved_attempt_lookup_rejects_invalid_ordinal(
+    tmp_path: Path, attempt: int
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        store.get_attempt(
+            _identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=attempt,
+        )
+    assert not store.path.exists()
+
+
+def test_reference_lookup_does_not_recreate_missing_database(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "missing" / "observations.sqlite")
+
+    with pytest.raises(ObservationStoreError, match="unavailable"):
+        store.get("missing")
+    with pytest.raises(ObservationStoreError, match="unavailable"):
+        store.get_many(())
+    with pytest.raises(ObservationStoreError, match="unavailable"), store.acquire_sampling_lock():
+        pytest.fail("missing evidence store was recreated")
+    with pytest.raises(ObservationStoreError, match="unavailable"):
+        store.get_attempt(
+            _identity(),
+            candidate_digest="candidate",
+            role=ObservationRole.SEARCH,
+            arm=ObservationArm.CANDIDATE,
+            attempt=1,
+        )
+    assert not store.path.parent.exists()
+
+
+def test_sampling_store_lock_excludes_another_owner(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    other = ObservationStore(store.path)
+    store.initialize()
+
+    with (
+        store.acquire_sampling_lock(),
+        pytest.raises(ObservationStoreBusyError, match="another sampled run"),
+        other.acquire_sampling_lock(),
+    ):
+        pytest.fail("second owner acquired the sampling store")
+    with other.acquire_sampling_lock():
+        pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_sampling_store_lock_refuses_unsafe_mode(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.initialize()
+    lock_path = store.path.with_name(f"{store.path.name}.sampling.lock")
+    lock_path.touch(mode=0o644)
+    lock_path.chmod(0o644)
+
+    with (
+        pytest.raises(ObservationStoreError, match="sampling lock file is unsafe"),
+        store.acquire_sampling_lock(),
+    ):
+        pytest.fail("unsafe sampling lock was accepted")
+
+
+def test_sampling_store_lock_refuses_symbolic_link(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    store.initialize()
+    target = tmp_path / "target"
+    target.touch(mode=0o600)
+    lock_path = store.path.with_name(f"{store.path.name}.sampling.lock")
+    lock_path.symlink_to(target)
+
+    with (
+        pytest.raises(ObservationStoreError, match="symbolic link"),
+        store.acquire_sampling_lock(),
+    ):
+        pytest.fail("linked sampling lock was accepted")
+    assert target.read_bytes() == b""
+
+
+@pytest.mark.parametrize("target_kind", ["database", "private-evidence"])
+def test_sampling_store_lock_refuses_hard_link_without_truncating_evidence(
+    tmp_path: Path, target_kind: str
+) -> None:
+    store = ObservationStore(tmp_path / "observations.sqlite")
+    observation = _observation(attempt=1)
+    store.append(observation)
+    target = store.path
+    if target_kind == "private-evidence":
+        target = tmp_path / "protected-evidence.json"
+        target.write_bytes(b'{"synthetic": "unchanged"}\n')
+        target.chmod(0o600)
+    original = target.read_bytes()
+    lock_path = store.path.with_name(f"{store.path.name}.sampling.lock")
+    lock_path.hardlink_to(target)
+
+    refusal = "exactly one link" if target_kind == "database" else "sampling lock file is unsafe"
+    with (
+        pytest.raises(ObservationStoreError, match=refusal),
+        store.acquire_sampling_lock(),
+    ):
+        pytest.fail("hard-linked sampling lock was accepted")
+
+    assert target.read_bytes() == original
+    assert lock_path.read_bytes() == original
+    lock_path.unlink()
+    assert store.get(observation.observation_id) == observation
